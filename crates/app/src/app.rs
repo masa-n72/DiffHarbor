@@ -15,6 +15,7 @@ use diff_core::{apply_hunk, diff_lines, DiffResult, RowKind};
 
 use crate::{
     document::Document,
+    theme::*,
     folder::{compare_dirs, copy_entry, FolderEntry, Status},
 };
 
@@ -32,6 +33,7 @@ actions!(
         Undo,
         Refresh,
         Back,
+        CloseWindow,
     ]
 );
 
@@ -48,31 +50,38 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-z", Undo, None),
         KeyBinding::new("cmd-r", Refresh, None),
         KeyBinding::new("cmd-[", Back, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.set_menus(vec![
         Menu {
             name: "DiffHarbor".into(),
-            items: vec![MenuItem::action("Quit DiffHarbor", Quit)],
+            items: vec![MenuItem::action("DiffHarbor を終了", Quit)],
         },
         Menu {
-            name: "File".into(),
+            name: "ファイル".into(),
             items: vec![
-                MenuItem::action("Open Left…", OpenLeft),
-                MenuItem::action("Open Right…", OpenRight),
+                MenuItem::action("左を開く…", OpenLeft),
+                MenuItem::action("右を開く…", OpenRight),
                 MenuItem::separator(),
-                MenuItem::action("Save", Save),
-                MenuItem::action("Refresh", Refresh),
+                MenuItem::action("保存", Save),
+                MenuItem::separator(),
+                MenuItem::action("フォルダを再比較", Refresh),
+                MenuItem::action("フォルダ一覧へ戻る", Back),
+                MenuItem::separator(),
+                MenuItem::action("ウインドウを閉じる", CloseWindow),
             ],
         },
         Menu {
-            name: "Diff".into(),
+            name: "差分".into(),
             items: vec![
-                MenuItem::action("Next Difference", NextDiff),
-                MenuItem::action("Previous Difference", PrevDiff),
-                MenuItem::action("Copy to Right", CopyToRight),
-                MenuItem::action("Copy to Left", CopyToLeft),
-                MenuItem::action("Undo", Undo),
+                MenuItem::action("次の差分", NextDiff),
+                MenuItem::action("前の差分", PrevDiff),
+                MenuItem::separator(),
+                MenuItem::action("右へコピー", CopyToRight),
+                MenuItem::action("左へコピー", CopyToLeft),
+                MenuItem::separator(),
+                MenuItem::action("元に戻す", Undo),
             ],
         },
     ]);
@@ -83,21 +92,6 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 }
-
-// Colors (dark theme).
-const BG: u32 = 0x1e1f26;
-const PANEL: u32 = 0x262833;
-const BORDER: u32 = 0x3a3d4d;
-const TEXT: u32 = 0xd8dae5;
-const DIM: u32 = 0x7d8196;
-const ACCENT: u32 = 0x4c78d8;
-const CHANGED: u32 = 0x3d3a22;
-const CHANGED_SEL: u32 = 0x5b5527;
-const DELETED: u32 = 0x452428;
-const DELETED_SEL: u32 = 0x65303a;
-const ADDED: u32 = 0x1f3b2a;
-const ADDED_SEL: u32 = 0x2a5a3c;
-const FILLER: u32 = 0x2b2d37;
 
 const ROW_H: f32 = 20.0;
 
@@ -506,10 +500,12 @@ impl DiffHarbor {
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(if enabled { 0x34384a } else { 0x2a2c38 }))
-            .text_color(rgb(if enabled { TEXT } else { 0x5b5f73 }))
+            .bg(rgb(if enabled { BUTTON } else { PANEL }))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_color(rgb(if enabled { TEXT } else { BUTTON_DISABLED_TEXT }))
             .text_size(px(12.))
-            .when(enabled, |b| b.cursor_pointer().hover(|s| s.bg(rgb(0x444a63))))
+            .when(enabled, |b| b.cursor_pointer().hover(|s| s.bg(rgb(BUTTON_HOVER))))
             .child(label.to_string())
     }
 
@@ -567,13 +563,13 @@ impl DiffHarbor {
                 .px_2()
                 .py_1()
                 .text_size(px(12.))
-                .text_color(rgb(DIM))
+                .text_color(rgb(TEXT))
                 .child(s)
         };
         div()
             .flex()
             .flex_row()
-            .bg(rgb(PANEL))
+            .bg(rgb(PATH_BAR))
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(cell(left))
@@ -616,12 +612,12 @@ impl DiffHarbor {
                 let selected = row.hunk.is_some() && row.hunk == f.current;
                 let (lbg, rbg) = match (row.kind, selected) {
                     (RowKind::Equal, _) => (None, None),
-                    (RowKind::Changed, false) => (Some(CHANGED), Some(CHANGED)),
-                    (RowKind::Changed, true) => (Some(CHANGED_SEL), Some(CHANGED_SEL)),
-                    (RowKind::LeftOnly, false) => (Some(DELETED), Some(FILLER)),
-                    (RowKind::LeftOnly, true) => (Some(DELETED_SEL), Some(FILLER)),
-                    (RowKind::RightOnly, false) => (Some(FILLER), Some(ADDED)),
-                    (RowKind::RightOnly, true) => (Some(FILLER), Some(ADDED_SEL)),
+                    (RowKind::Changed, false) => (Some(DIFF), Some(DIFF)),
+                    (RowKind::Changed, true) => (Some(DIFF_SEL), Some(DIFF_SEL)),
+                    (RowKind::LeftOnly, false) => (Some(DIFF), Some(FILLER)),
+                    (RowKind::LeftOnly, true) => (Some(DIFF_SEL), Some(FILLER_SEL)),
+                    (RowKind::RightOnly, false) => (Some(FILLER), Some(DIFF)),
+                    (RowKind::RightOnly, true) => (Some(FILLER_SEL), Some(DIFF_SEL)),
                 };
                 let side = |doc: &Document, line: Option<usize>, bg: Option<u32>| {
                     let (num, text) = match line {
@@ -642,10 +638,12 @@ impl DiffHarbor {
                                 .flex_none()
                                 .pr_2()
                                 .text_right()
+                                .h_full()
+                                .bg(rgb(GUTTER))
                                 .text_color(rgb(DIM))
                                 .child(num),
                         )
-                        .child(div().flex_1().whitespace_nowrap().child(text))
+                        .child(div().flex_1().pl_1().whitespace_nowrap().child(text))
                 };
 
                 let first_of_hunk = row.hunk.filter(|&h| f.diff.hunks[h].first_row == ix);
@@ -671,8 +669,10 @@ impl DiffHarbor {
                             .cursor_pointer()
                             .text_size(px(11.))
                             .text_color(rgb(TEXT))
-                            .bg(rgb(0x3a3f55))
-                            .hover(|s| s.bg(rgb(ACCENT)))
+                            .bg(rgb(BUTTON))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .hover(|s| s.bg(rgb(BUTTON_HOVER)).border_color(rgb(ACCENT)))
                             .child(label)
                     };
                     mid = mid
@@ -687,7 +687,7 @@ impl DiffHarbor {
                         .flex_row()
                         .w_full()
                         .h(px(ROW_H))
-                        .font_family("Menlo")
+                        .font_family(MONO_FONT)
                         .text_size(px(12.))
                         .line_height(px(ROW_H))
                         .text_color(rgb(TEXT))
@@ -729,11 +729,11 @@ impl DiffHarbor {
                 let entry = f.entries.get(*f.visible.get(ix)?)?;
                 let selected = f.selected == Some(ix);
                 let (label, color) = match entry.status {
-                    Status::Identical => ("同一", 0x6fbf73),
-                    Status::Different => ("差異あり", 0xe5c06b),
-                    Status::LeftOnly => ("左のみ", 0xe06c75),
-                    Status::RightOnly => ("右のみ", 0x61afef),
-                    Status::TypeMismatch => ("種類が異なる", 0xc678dd),
+                    Status::Identical => ("同一", STATUS_IDENTICAL),
+                    Status::Different => ("差異あり", STATUS_DIFFERENT),
+                    Status::LeftOnly => ("左のみ", STATUS_LEFT_ONLY),
+                    Status::RightOnly => ("右のみ", STATUS_RIGHT_ONLY),
+                    Status::TypeMismatch => ("種類が異なる", STATUS_MISMATCH),
                 };
                 let name = format!("{}{}", if entry.is_dir { "▾ " } else { "   " }, entry.name);
                 Some(
@@ -747,8 +747,8 @@ impl DiffHarbor {
                         .text_size(px(13.))
                         .text_color(rgb(TEXT))
                         .cursor_pointer()
-                        .when(selected, |d| d.bg(rgb(0x31405f)))
-                        .when(!selected, |d| d.hover(|s| s.bg(rgb(0x2a2d3a))))
+                        .when(selected, |d| d.bg(rgb(ROW_SELECTED)))
+                        .when(!selected, |d| d.hover(|s| s.bg(rgb(ROW_HOVER))))
                         .on_click(cx.listener(move |t, e: &ClickEvent, _, cx| {
                             t.select_entry(ix, cx);
                             if e.click_count() >= 2 {
@@ -762,7 +762,7 @@ impl DiffHarbor {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .pl(px(10. + entry.depth as f32 * 18.))
-                                .when(entry.is_dir, |d| d.text_color(rgb(0x9aa5ce)))
+                                .when(entry.is_dir, |d| d.text_color(rgb(DIR_NAME)))
                                 .child(name),
                         )
                         .child(div().w(px(120.)).flex_none().text_color(rgb(color)).child(label))
@@ -814,6 +814,7 @@ impl Render for DiffHarbor {
             .on_action(cx.listener(|t, _: &Undo, _, cx| t.undo(cx)))
             .on_action(cx.listener(|t, _: &Refresh, _, cx| t.refresh(cx)))
             .on_action(cx.listener(|t, _: &Back, _, cx| t.back(cx)))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .flex()
             .flex_col()
             .size_full()
