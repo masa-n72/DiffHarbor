@@ -1,19 +1,24 @@
 //! The DiffHarbor main view: toolbar, folder comparison and side-by-side file diff.
 
 use std::{
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
 };
 
 use gpui::{
-    actions, div, prelude::*, px, rgb, uniform_list, AnyElement, App, ClickEvent, Context,
-    FocusHandle, KeyBinding, Menu, MenuItem, PathPromptOptions, Render, ScrollStrategy,
-    SharedString, Stateful, UniformListScrollHandle, Window,
+    actions, div, font, prelude::*, px, rgb, uniform_list, AnyElement, App, ClickEvent, Context,
+    FocusHandle, HighlightStyle, KeyBinding, Menu, MenuItem, PathPromptOptions, Render,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Stateful, StyledText, UniformListScrollHandle,
+    Window,
 };
 
-use diff_core::{apply_hunk, diff_lines, DiffResult, RowKind};
+use diff_core::{apply_hunk, diff_lines, diff_lines_deadline, token_spans, DiffResult, RowKind};
 
 use crate::{
+    display::{display_width, expand_tabs},
     document::Document,
     theme::*,
     folder::{compare_dirs, copy_entry, FolderEntry, Status},
@@ -94,6 +99,28 @@ pub fn init(cx: &mut App) {
 }
 
 const ROW_H: f32 = 20.0;
+const FONT_SIZE: f32 = 12.0;
+/// 行番号欄の幅。
+const GUTTER_W: f32 = 48.0;
+/// 中央の操作列の幅。
+const MID_W: f32 = 44.0;
+/// 左右の合計がこの行数以下なら、差分をその場で計算する。超える場合は別スレッドで計算する。
+const SYNC_DIFF_LINES: usize = 20_000;
+/// 差分計算の制限時間。超えた場合は最小ではない差分になる。
+const DIFF_TIME_LIMIT: Duration = Duration::from_secs(5);
+/// これより長い行は、行内の差分を取らずに行全体を強調する。
+const TOKEN_DIFF_MAX_BYTES: usize = 2000;
+
+type Spans = Rc<(Vec<Range<usize>>, Vec<Range<usize>>)>;
+
+/// 開発時の確認用。デバッグビルドでは DIFFHARBOR_DEBUG_HSCROLL で横スクロールの初期位置を指定できる。
+fn debug_initial_h_scroll() -> f32 {
+    if cfg!(debug_assertions) {
+        std::env::var("DIFFHARBOR_DEBUG_HSCROLL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
@@ -150,18 +177,41 @@ struct FileView {
     current: Option<usize>,
     undo: Vec<Snapshot>,
     back: Option<Box<FolderView>>,
+    /// 差分を別スレッドで計算中か。計算中は行の一覧を出さない。
+    computing: bool,
+    /// 差分計算の世代。古い計算結果を捨てるために使う。
+    generation: u64,
+    /// 横スクロール量（ピクセル）。左右のペインで共有する。
+    h_scroll: f32,
+    /// 最長行の表示幅（ピクセル）。差分の更新時に破棄し、描画時に計算し直す。
+    max_line_px: Option<f32>,
+    /// 変更行ごとの行内差分。キーは表示行の番号。
+    span_cache: HashMap<usize, Spans>,
 }
 
 impl FileView {
     fn new(left: &Path, right: &Path, back: Option<Box<FolderView>>) -> anyhow::Result<Self> {
         let (left, right) = (Document::load(left)?, Document::load(right)?);
-        let diff = diff_lines(&left.lines, &right.lines);
-        let current = (!diff.hunks.is_empty()).then_some(0);
-        Ok(Self { left, right, diff, current, undo: Vec::new(), back })
+        Ok(Self {
+            left,
+            right,
+            diff: DiffResult::default(),
+            current: None,
+            undo: Vec::new(),
+            back,
+            computing: false,
+            generation: 0,
+            h_scroll: debug_initial_h_scroll(),
+            max_line_px: None,
+            span_cache: HashMap::new(),
+        })
     }
 
-    fn rediff(&mut self) {
-        self.diff = diff_lines(&self.left.lines, &self.right.lines);
+    fn set_diff(&mut self, diff: DiffResult) {
+        self.diff = diff;
+        self.computing = false;
+        self.span_cache.clear();
+        self.max_line_px = None;
         self.current = match (self.current, self.diff.hunks.len()) {
             (_, 0) => None,
             (Some(c), n) => Some(c.min(n - 1)),
@@ -176,6 +226,22 @@ impl FileView {
             left_dirty: self.left.dirty,
             right_dirty: self.right.dirty,
         });
+    }
+
+    /// 表示行 `ix` が変更行なら、行内の差分を計算して覚えておく。
+    fn ensure_spans(&mut self, ix: usize) {
+        let Some(row) = self.diff.rows.get(ix) else { return };
+        if row.kind != RowKind::Changed || self.span_cache.contains_key(&ix) {
+            return;
+        }
+        let (Some(l), Some(r)) = (row.left, row.right) else { return };
+        let (lt, rt) = (&self.left.lines[l], &self.right.lines[r]);
+        let spans = if lt.len() > TOKEN_DIFF_MAX_BYTES || rt.len() > TOKEN_DIFF_MAX_BYTES {
+            (vec![0..lt.len()], vec![0..rt.len()])
+        } else {
+            token_spans(lt, rt)
+        };
+        self.span_cache.insert(ix, Rc::new(spans));
     }
 }
 
@@ -195,6 +261,8 @@ pub struct DiffHarbor {
     folder_scroll: UniformListScrollHandle,
     only_diffs: bool,
     title: String,
+    /// 等幅フォントの半角 1 文字の幅。最初の描画で測る。
+    char_w: Option<f32>,
 }
 
 impl DiffHarbor {
@@ -211,6 +279,7 @@ impl DiffHarbor {
             folder_scroll: UniformListScrollHandle::new(),
             only_diffs: false,
             title: String::new(),
+            char_w: None,
         };
         if let [l, r, ..] = args.as_slice() {
             this.left_path = Some(l.clone());
@@ -272,15 +341,7 @@ impl DiffHarbor {
             Ok(view) => {
                 self.view = view;
                 match &self.view {
-                    View::File(f) => {
-                        let n = f.diff.hunks.len();
-                        self.status = if n == 0 {
-                            "ファイルは同一です".into()
-                        } else {
-                            format!("{n} 件の差分").into()
-                        };
-                        self.scroll_to_current();
-                    }
+                    View::File(_) => self.start_diff(cx),
                     View::Folder(f) => {
                         let n = f.entries.iter().filter(|e| !e.is_dir && e.status != Status::Identical).count();
                         self.status = format!("{n} 件のファイルに差分があります").into();
@@ -290,6 +351,49 @@ impl DiffHarbor {
             }
             Err(e) => self.status = e.to_string().into(),
         }
+        cx.notify();
+    }
+
+    /// 現在のファイル比較の差分を計算し直す。大きなファイルは別スレッドで計算する。
+    fn start_diff(&mut self, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        f.generation += 1;
+        if f.left.lines.len() + f.right.lines.len() <= SYNC_DIFF_LINES {
+            let diff = diff_lines(&f.left.lines, &f.right.lines);
+            f.set_diff(diff);
+            self.after_diff(cx);
+            return;
+        }
+        f.computing = true;
+        let generation = f.generation;
+        let (l, r) = (f.left.lines.clone(), f.right.lines.clone());
+        let task = cx
+            .background_executor()
+            .spawn(async move { diff_lines_deadline(&l, &r, Some(DIFF_TIME_LIMIT)) });
+        self.status = "比較中…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let diff = task.await;
+            this.update(cx, |this, cx| {
+                if let View::File(f) = &mut this.view {
+                    // 計算中に別の比較が始まっていたら、この結果は捨てる。
+                    if f.generation == generation {
+                        f.set_diff(diff);
+                        this.after_diff(cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn after_diff(&mut self, cx: &mut Context<Self>) {
+        if let View::File(f) = &self.view {
+            let n = f.diff.hunks.len();
+            self.status = if n == 0 { "差分はありません".into() } else { format!("{n} 件の差分").into() };
+        }
+        self.scroll_to_current();
         cx.notify();
     }
 
@@ -319,8 +423,7 @@ impl DiffHarbor {
         match FileView::new(&l, &r, Some(Box::new(folder.clone()))) {
             Ok(fv) => {
                 self.view = View::File(fv);
-                self.scroll_to_current();
-                cx.notify();
+                self.start_diff(cx);
             }
             Err(e) => {
                 self.view = View::Folder(folder);
@@ -386,10 +489,19 @@ impl DiffHarbor {
         }
     }
 
+    fn select_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        if let View::File(f) = &mut self.view {
+            if !f.computing && hunk < f.diff.hunks.len() && f.current != Some(hunk) {
+                f.current = Some(hunk);
+                cx.notify();
+            }
+        }
+    }
+
     fn step_hunk(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let View::File(f) = &mut self.view {
             let n = f.diff.hunks.len();
-            if n == 0 {
+            if n == 0 || f.computing {
                 return;
             }
             let next = match f.current {
@@ -404,6 +516,9 @@ impl DiffHarbor {
 
     fn copy_hunk(&mut self, hunk: usize, to: Side, cx: &mut Context<Self>) {
         let View::File(f) = &mut self.view else { return };
+        if f.computing {
+            return;
+        }
         let Some(h) = f.diff.hunks.get(hunk).cloned() else { return };
         f.snapshot();
         match to {
@@ -417,13 +532,7 @@ impl DiffHarbor {
             }
         }
         f.current = Some(hunk);
-        f.rediff();
-        let remaining = f.diff.hunks.len();
-        self.scroll_to_current();
-        self.set_status(
-            if remaining == 0 { "差分はありません".to_string() } else { format!("残り {remaining} 件の差分") },
-            cx,
-        );
+        self.start_diff(cx);
     }
 
     fn copy_current(&mut self, to: Side, cx: &mut Context<Self>) {
@@ -440,6 +549,9 @@ impl DiffHarbor {
 
     fn undo(&mut self, cx: &mut Context<Self>) {
         let View::File(f) = &mut self.view else { return };
+        if f.computing {
+            return;
+        }
         let Some(s) = f.undo.pop() else {
             self.set_status("元に戻す操作がありません", cx);
             return;
@@ -448,9 +560,7 @@ impl DiffHarbor {
         f.right.lines = s.right;
         f.left.dirty = s.left_dirty;
         f.right.dirty = s.right_dirty;
-        f.rediff();
-        self.scroll_to_current();
-        cx.notify();
+        self.start_diff(cx);
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -578,34 +688,151 @@ impl DiffHarbor {
             .into_any_element()
     }
 
-    fn render_file(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let View::File(f) = &self.view else { return div().into_any_element() };
+    /// 片側のペインで本文に使える幅（行番号欄を除く）。
+    fn pane_text_width(window: &Window) -> f32 {
+        ((f32::from(window.viewport_size().width) - MID_W) / 2.0 - GUTTER_W).max(1.0)
+    }
+
+    /// 横方向にスクロールする。`dx` はホイールの移動量で、正なら左へ戻る。
+    fn scroll_horizontally(&mut self, dx: f32, window: &Window, cx: &mut Context<Self>) {
+        let char_w = self.char_w.unwrap_or(FONT_SIZE * 0.6);
+        let View::File(f) = &mut self.view else { return };
+        let content = f.max_line_px.unwrap_or(0.0) + char_w * 2.0;
+        let max = (content - Self::pane_text_width(window)).max(0.0);
+        let next = (f.h_scroll - dx).clamp(0.0, max);
+        if next != f.h_scroll {
+            f.h_scroll = next;
+            cx.notify();
+        }
+    }
+
+    fn render_file(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // 半角 1 文字の幅を一度だけ測る。横スクロールの範囲の計算に使う。
+        let char_w = *self.char_w.get_or_insert_with(|| {
+            let ts = window.text_system();
+            let id = ts.resolve_font(&font(MONO_FONT));
+            ts.em_advance(id, px(FONT_SIZE)).map(f32::from).unwrap_or(FONT_SIZE * 0.6)
+        });
+        let pane_w = Self::pane_text_width(window);
+        let View::File(f) = &mut self.view else { return div().into_any_element() };
+
+        let content_w = *f.max_line_px.get_or_insert_with(|| {
+            f.left
+                .lines
+                .iter()
+                .chain(f.right.lines.iter())
+                .map(|l| {
+                    let (narrow, wide) = display_width(l);
+                    narrow as f32 * char_w + wide as f32 * FONT_SIZE
+                })
+                .fold(0.0, f32::max)
+        }) + char_w * 2.0;
+        // ウィンドウを広げた時に、スクロール位置が範囲外に残らないようにする。
+        f.h_scroll = f.h_scroll.min((content_w - pane_w).max(0.0));
+
         let mark = |d: &Document| if d.dirty { " ●" } else { "" };
         let header = Self::path_header(
             format!("{}{}", f.left.path.display(), mark(&f.left)),
             format!("{}{}", f.right.path.display(), mark(&f.right)),
         );
-        let count = f.diff.rows.len();
+
+        let body = if f.computing {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(DIM))
+                .child("比較中…")
+                .into_any_element()
+        } else {
+            uniform_list(
+                "diff-rows",
+                f.diff.rows.len(),
+                cx.processor(|this, range: Range<usize>, _w, cx| this.render_rows(range, cx)),
+            )
+            .track_scroll(self.diff_scroll.clone())
+            .flex_1()
+            .w_full()
+            .into_any_element()
+        };
+
+        // 横スクロールの位置を示すバー。内容がペインに収まる時はつまみを出さない。
+        let h_bar = |h_scroll: f32| {
+            let track = div().flex_1().min_w_0().h_full().overflow_hidden();
+            let track = if content_w > pane_w {
+                let thumb_w = (pane_w * pane_w / content_w).max(24.0);
+                let offset = h_scroll / (content_w - pane_w) * (pane_w - thumb_w);
+                track.child(div().ml(px(offset)).w(px(thumb_w)).h_full().rounded_sm().bg(rgb(SCROLL_THUMB)))
+            } else {
+                track
+            };
+            div().flex().flex_row().flex_1().min_w_0().child(div().w(px(GUTTER_W)).flex_none()).child(track)
+        };
+        let h_scroll = f.h_scroll;
+        let scroll_bar = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .h(px(6.))
+            .bg(rgb(PANEL))
+            .child(h_bar(h_scroll))
+            .child(div().w(px(MID_W)).flex_none())
+            .child(h_bar(h_scroll));
+
+        let pane_status = |d: &Document| {
+            let mut text = format!("{}　　{}　　{} 行", d.encoding_label(), d.eol_label(), d.lines.len());
+            if d.lossy {
+                text.push_str("　　変換できない文字があります（保存できません）");
+            }
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .px_2()
+                .py_1()
+                .text_size(px(12.))
+                .text_color(rgb(if d.lossy { STATUS_LEFT_ONLY } else { TEXT }))
+                .child(text)
+        };
+        let status = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .bg(rgb(PANEL))
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(pane_status(&f.left))
+            .child(div().w(px(MID_W)).flex_none())
+            .child(pane_status(&f.right));
+
         div()
             .flex()
             .flex_col()
             .size_full()
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
+                let d = ev.delta.pixel_delta(px(ROW_H));
+                let (dx, dy) = (f32::from(d.x), f32::from(d.y));
+                if dx != 0.0 && dx.abs() > dy.abs() {
+                    this.scroll_horizontally(dx, window, cx);
+                }
+            }))
             .child(header)
-            .child(
-                uniform_list(
-                    "diff-rows",
-                    count,
-                    cx.processor(|this, range: Range<usize>, _w, cx| this.render_rows(range, cx)),
-                )
-                .track_scroll(self.diff_scroll.clone())
-                .flex_1()
-                .w_full(),
-            )
+            .child(body)
+            .child(scroll_bar)
+            .child(status)
             .into_any_element()
     }
 
     fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if let View::File(f) = &mut self.view {
+            for ix in range.clone() {
+                f.ensure_spans(ix);
+            }
+        }
         let View::File(f) = &self.view else { return Vec::new() };
+        let h_scroll = f.h_scroll;
         range
             .filter_map(|ix| {
                 let row = *f.diff.rows.get(ix)?;
@@ -619,11 +846,19 @@ impl DiffHarbor {
                     (RowKind::RightOnly, false) => (Some(FILLER), Some(DIFF)),
                     (RowKind::RightOnly, true) => (Some(FILLER_SEL), Some(DIFF_SEL)),
                 };
-                let side = |doc: &Document, line: Option<usize>, bg: Option<u32>| {
-                    let (num, text) = match line {
-                        Some(i) => ((i + 1).to_string(), doc.lines[i].replace('\t', "    ")),
-                        None => (String::new(), String::new()),
+                let word_bg = if selected { WORD_SEL } else { WORD };
+                let spans = f.span_cache.get(&ix).cloned();
+
+                let side = |doc: &Document, line: Option<usize>, bg: Option<u32>, spans: &[Range<usize>]| {
+                    let (num, text, highlights) = match line {
+                        Some(i) => {
+                            let (text, spans) = expand_tabs(&doc.lines[i], spans);
+                            ((i + 1).to_string(), text, spans)
+                        }
+                        None => (String::new(), String::new(), Vec::new()),
                     };
+                    let style = HighlightStyle { background_color: Some(rgb(word_bg).into()), ..Default::default() };
+                    let text = StyledText::new(text).with_highlights(highlights.into_iter().map(|r| (r, style)));
                     div()
                         .flex()
                         .flex_row()
@@ -634,7 +869,7 @@ impl DiffHarbor {
                         .when_some(bg, |d, c| d.bg(rgb(c)))
                         .child(
                             div()
-                                .w(px(48.))
+                                .w(px(GUTTER_W))
                                 .flex_none()
                                 .pr_2()
                                 .text_right()
@@ -643,12 +878,23 @@ impl DiffHarbor {
                                 .text_color(rgb(DIM))
                                 .child(num),
                         )
-                        .child(div().flex_1().pl_1().whitespace_nowrap().child(text))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .overflow_hidden()
+                                .child(div().ml(px(4.0 - h_scroll)).whitespace_nowrap().child(text)),
+                        )
+                };
+                let (ls, rs): (&[Range<usize>], &[Range<usize>]) = match &spans {
+                    Some(s) => (&s.0, &s.1),
+                    None => (&[], &[]),
                 };
 
                 let first_of_hunk = row.hunk.filter(|&h| f.diff.hunks[h].first_row == ix);
                 let mut mid = div()
-                    .w(px(44.))
+                    .w(px(MID_W))
                     .flex_none()
                     .flex()
                     .flex_row()
@@ -688,12 +934,16 @@ impl DiffHarbor {
                         .w_full()
                         .h(px(ROW_H))
                         .font_family(MONO_FONT)
-                        .text_size(px(12.))
+                        .text_size(px(FONT_SIZE))
                         .line_height(px(ROW_H))
                         .text_color(rgb(TEXT))
-                        .child(side(&f.left, row.left, lbg))
+                        // 差分行をクリックすると、その差分を選択する。
+                        .when_some(row.hunk, |d, h| {
+                            d.on_click(cx.listener(move |t, _: &ClickEvent, _, cx| t.select_hunk(h, cx)))
+                        })
+                        .child(side(&f.left, row.left, lbg, ls))
                         .child(mid)
-                        .child(side(&f.right, row.right, rbg))
+                        .child(side(&f.right, row.right, rbg, rs))
                         .into_any_element(),
                 )
             })
@@ -798,7 +1048,7 @@ impl Render for DiffHarbor {
                 .child("ファイルまたはフォルダを左右に開いて比較します")
                 .into_any_element(),
             View::Folder(_) => self.render_folder(cx),
-            View::File(_) => self.render_file(cx),
+            View::File(_) => self.render_file(window, cx),
         };
 
         div()

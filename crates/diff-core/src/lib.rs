@@ -6,6 +6,6 @@
 pub mod diff;
 pub mod text;
 
-pub use diff::{apply_hunk, diff_lines, token_spans, DiffResult, Hunk, Row, RowKind};
+pub use diff::{apply_hunk, diff_lines, diff_lines_deadline, token_spans, DiffResult, Hunk, Row, RowKind};
 pub use encoding_rs::{Encoding, EUC_JP, SHIFT_JIS, UTF_8};
 pub use text::{decode, load, save, Eol, TextFile};

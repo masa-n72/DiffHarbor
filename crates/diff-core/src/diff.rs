@@ -1,8 +1,11 @@
 //! 行差分、差分ブロック、行内のトークン差分。
 
-use std::ops::Range;
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
-use similar::{capture_diff_slices, Algorithm, DiffOp};
+use similar::{capture_diff_slices, capture_diff_slices_deadline, Algorithm, DiffOp};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RowKind {
@@ -36,7 +39,13 @@ pub struct DiffResult {
 }
 
 pub fn diff_lines(left: &[String], right: &[String]) -> DiffResult {
-    let ops = capture_diff_slices(Algorithm::Myers, left, right);
+    diff_lines_deadline(left, right, None)
+}
+
+/// 制限時間つきの行差分。時間を超えた場合は、最小ではないが正しい差分を返す。
+pub fn diff_lines_deadline(left: &[String], right: &[String], limit: Option<Duration>) -> DiffResult {
+    let deadline = limit.map(|d| Instant::now() + d);
+    let ops = capture_diff_slices_deadline(Algorithm::Myers, left, right, deadline);
     let mut out = DiffResult::default();
     // 未確定の差分ブロック: (左の開始, 左の行数, 右の開始, 右の行数)。
     let mut pending: Option<(usize, usize, usize, usize)> = None;
@@ -204,6 +213,18 @@ mod tests {
             let d = diff_lines(&l, &r);
             let Some(h) = d.hunks.first().cloned() else { break };
             apply_hunk(&mut r, h.right, &l, h.left);
+        }
+        assert_eq!(l, r);
+    }
+
+    #[test]
+    fn deadline_still_yields_a_valid_diff() {
+        // 全行が異なる大きな入力。制限時間を 0 にしても、マージすれば一致する差分が返る。
+        let l: Vec<String> = (0..4000).map(|i| format!("left {i}")).collect();
+        let mut r: Vec<String> = (0..4000).map(|i| format!("right {i}")).collect();
+        let d = diff_lines_deadline(&l, &r, Some(Duration::ZERO));
+        for h in d.hunks.iter().rev() {
+            apply_hunk(&mut r, h.right.clone(), &l, h.left.clone());
         }
         assert_eq!(l, r);
     }

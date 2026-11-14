@@ -23,11 +23,11 @@ pub const DIFF_SEL: u32 = 0xEF7774;
 /// 相手側にしかない行を埋める空行。
 pub const FILLER: u32 = 0xC0C0C0;
 pub const FILLER_SEL: u32 = 0xF0C0C0;
-/// 行内の変更箇所（M3 で使用）。
-#[allow(dead_code)]
+/// 行内の変更箇所。
 pub const WORD: u32 = 0xF1E2AD;
-#[allow(dead_code)]
 pub const WORD_SEL: u32 = 0xFFA0A0;
+/// 横スクロールバーのつまみ。
+pub const SCROLL_THUMB: u32 = 0xA8A8A8;
 
 pub const BUTTON: u32 = 0xFFFFFF;
 pub const BUTTON_HOVER: u32 = 0xDCE9FB;

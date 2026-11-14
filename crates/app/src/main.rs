@@ -1,4 +1,5 @@
 mod app;
+mod display;
 mod document;
 mod folder;
 mod theme;
@@ -36,6 +37,9 @@ fn main() {
             move |window, cx| cx.new(|cx| app::DiffHarbor::new(args, window, cx)),
         )
         .unwrap();
-        cx.activate(true);
+        // 開発時の確認用。DIFFHARBOR_NO_ACTIVATE を設定すると、起動時に前面へ出ない。
+        if std::env::var_os("DIFFHARBOR_NO_ACTIVATE").is_none() {
+            cx.activate(true);
+        }
     });
 }
