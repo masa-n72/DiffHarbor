@@ -1,0 +1,9 @@
+[package]
+name = "diffharbor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+diff-core.workspace = true

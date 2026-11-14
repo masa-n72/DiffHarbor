@@ -1,0 +1,10 @@
+[package]
+name = "diff-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+similar.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true

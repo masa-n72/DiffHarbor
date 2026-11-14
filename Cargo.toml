@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/diff-core", "crates/app"]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+similar = "3"
+encoding_rs = "0.8"
+chardetng = "1"
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+diff-core = { path = "crates/diff-core" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
