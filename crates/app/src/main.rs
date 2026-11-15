@@ -2,6 +2,7 @@ mod app;
 mod display;
 mod document;
 mod folder;
+mod location;
 mod theme;
 
 use std::path::PathBuf;

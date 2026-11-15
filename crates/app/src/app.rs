@@ -1,6 +1,7 @@
 //! The DiffHarbor main view: toolbar, folder comparison and side-by-side file diff.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
@@ -9,10 +10,11 @@ use std::{
 };
 
 use gpui::{
-    actions, div, font, prelude::*, px, rgb, uniform_list, AnyElement, App, ClickEvent, Context,
-    FocusHandle, HighlightStyle, KeyBinding, Menu, MenuItem, PathPromptOptions, Render,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Stateful, StyledText, UniformListScrollHandle,
-    Window,
+    actions, canvas, div, fill, font, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
+    AnyElement, App, BorderStyle, Bounds, ClickEvent, Context, Corners, Edges, FocusHandle,
+    HighlightStyle, Hsla, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    PathPromptOptions, Render, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
+    StyledText, UniformListScrollHandle, Window,
 };
 
 use diff_core::{apply_hunk, diff_lines, diff_lines_deadline, token_spans, DiffResult, RowKind};
@@ -22,6 +24,7 @@ use crate::{
     document::Document,
     theme::*,
     folder::{compare_dirs, copy_entry, FolderEntry, Status},
+    location,
 };
 
 actions!(
@@ -32,6 +35,8 @@ actions!(
         OpenRight,
         NextDiff,
         PrevDiff,
+        FirstDiff,
+        LastDiff,
         CopyToRight,
         CopyToLeft,
         Save,
@@ -49,6 +54,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-o", OpenRight, None),
         KeyBinding::new("alt-down", NextDiff, None),
         KeyBinding::new("alt-up", PrevDiff, None),
+        KeyBinding::new("alt-home", FirstDiff, None),
+        KeyBinding::new("alt-end", LastDiff, None),
+        // Home / End キーがないキーボード向け。
+        KeyBinding::new("alt-cmd-up", FirstDiff, None),
+        KeyBinding::new("alt-cmd-down", LastDiff, None),
         KeyBinding::new("alt-right", CopyToRight, None),
         KeyBinding::new("alt-left", CopyToLeft, None),
         KeyBinding::new("cmd-s", Save, None),
@@ -82,6 +92,8 @@ pub fn init(cx: &mut App) {
             items: vec![
                 MenuItem::action("次の差分", NextDiff),
                 MenuItem::action("前の差分", PrevDiff),
+                MenuItem::action("先頭の差分", FirstDiff),
+                MenuItem::action("末尾の差分", LastDiff),
                 MenuItem::separator(),
                 MenuItem::action("右へコピー", CopyToRight),
                 MenuItem::action("左へコピー", CopyToLeft),
@@ -104,6 +116,10 @@ const FONT_SIZE: f32 = 12.0;
 const GUTTER_W: f32 = 48.0;
 /// 中央の操作列の幅。
 const MID_W: f32 = 44.0;
+/// 左端の位置ペインの幅。
+const LOC_W: f32 = 44.0;
+/// 位置ペインの上下の余白。
+const LOC_PAD: f32 = 6.0;
 /// 左右の合計がこの行数以下なら、差分をその場で計算する。超える場合は別スレッドで計算する。
 const SYNC_DIFF_LINES: usize = 20_000;
 /// 差分計算の制限時間。超えた場合は最小ではない差分になる。
@@ -112,6 +128,15 @@ const DIFF_TIME_LIMIT: Duration = Duration::from_secs(5);
 const TOKEN_DIFF_MAX_BYTES: usize = 2000;
 
 type Spans = Rc<(Vec<Range<usize>>, Vec<Range<usize>>)>;
+
+/// 開発時の確認用。デバッグビルドでは DIFFHARBOR_DEBUG_HUNK で最初に選択する差分（0 始まり）を指定できる。
+fn debug_initial_hunk() -> usize {
+    if cfg!(debug_assertions) {
+        std::env::var("DIFFHARBOR_DEBUG_HUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    }
+}
 
 /// 開発時の確認用。デバッグビルドでは DIFFHARBOR_DEBUG_HSCROLL で横スクロールの初期位置を指定できる。
 fn debug_initial_h_scroll() -> f32 {
@@ -173,7 +198,8 @@ struct Snapshot {
 struct FileView {
     left: Document,
     right: Document,
-    diff: DiffResult,
+    /// 位置ペインの描画と共有するので Rc で持つ。
+    diff: Rc<DiffResult>,
     current: Option<usize>,
     undo: Vec<Snapshot>,
     back: Option<Box<FolderView>>,
@@ -195,7 +221,7 @@ impl FileView {
         Ok(Self {
             left,
             right,
-            diff: DiffResult::default(),
+            diff: Rc::new(DiffResult::default()),
             current: None,
             undo: Vec::new(),
             back,
@@ -208,14 +234,14 @@ impl FileView {
     }
 
     fn set_diff(&mut self, diff: DiffResult) {
-        self.diff = diff;
+        self.diff = Rc::new(diff);
         self.computing = false;
         self.span_cache.clear();
         self.max_line_px = None;
         self.current = match (self.current, self.diff.hunks.len()) {
             (_, 0) => None,
             (Some(c), n) => Some(c.min(n - 1)),
-            (None, _) => Some(0),
+            (None, n) => Some(debug_initial_hunk().min(n - 1)),
         };
     }
 
@@ -263,6 +289,8 @@ pub struct DiffHarbor {
     title: String,
     /// 等幅フォントの半角 1 文字の幅。最初の描画で測る。
     char_w: Option<f32>,
+    /// 位置ペインのバーの (上端の y 座標, 高さ)。描画時に記録し、クリック位置の計算に使う。
+    loc_geom: Rc<Cell<Option<(f32, f32)>>>,
 }
 
 impl DiffHarbor {
@@ -280,6 +308,7 @@ impl DiffHarbor {
             only_diffs: false,
             title: String::new(),
             char_w: None,
+            loc_geom: Rc::new(Cell::new(None)),
         };
         if let [l, r, ..] = args.as_slice() {
             this.left_path = Some(l.clone());
@@ -499,19 +528,49 @@ impl DiffHarbor {
     }
 
     fn step_hunk(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if let View::File(f) = &mut self.view {
-            let n = f.diff.hunks.len();
-            if n == 0 || f.computing {
-                return;
-            }
-            let next = match f.current {
-                None => 0,
-                Some(c) => (c as isize + delta).clamp(0, n as isize - 1) as usize,
-            };
-            f.current = Some(next);
-            self.scroll_to_current();
-            cx.notify();
+        let View::File(f) = &mut self.view else { return };
+        let n = f.diff.hunks.len();
+        if n == 0 || f.computing {
+            return;
         }
+        let next = match f.current {
+            None => 0,
+            Some(c) => (c as isize + delta).clamp(0, n as isize - 1) as usize,
+        };
+        // 端で止まった時は、移動せずにその旨を知らせる。
+        if f.current == Some(next) {
+            self.status = if delta > 0 { "最後の差分です".into() } else { "最初の差分です".into() };
+        } else {
+            f.current = Some(next);
+            self.status = format!("{n} 件の差分").into();
+        }
+        self.scroll_to_current();
+        cx.notify();
+    }
+
+    /// 先頭（`last` が false）または末尾の差分へ移動する。
+    fn goto_edge_hunk(&mut self, last: bool, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        let n = f.diff.hunks.len();
+        if n == 0 || f.computing {
+            return;
+        }
+        f.current = Some(if last { n - 1 } else { 0 });
+        self.status = format!("{n} 件の差分").into();
+        self.scroll_to_current();
+        cx.notify();
+    }
+
+    /// 位置ペイン上の y 座標に対応する行へスクロールする。
+    fn jump_to_location(&mut self, y: f32, cx: &mut Context<Self>) {
+        let View::File(f) = &self.view else { return };
+        let Some((top, bar_h)) = self.loc_geom.get() else { return };
+        if f.computing || f.diff.rows.is_empty() {
+            return;
+        }
+        let row = location::row_at(y - top, bar_h, f.diff.rows.len());
+        self.diff_scroll.scroll_to_item(row, ScrollStrategy::Center);
+        cx.notify();
     }
 
     fn copy_hunk(&mut self, hunk: usize, to: Side, cx: &mut Context<Self>) {
@@ -645,8 +704,10 @@ impl DiffHarbor {
                 d.child(Self::button("back", "← フォルダへ", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.back(cx))))
             })
             .when(in_file, |d| {
-                d.child(Self::button("prev", "↑ 前の差分", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.step_hunk(-1, cx)))))
+                d.child(Self::button("first", "⤒ 先頭", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.goto_edge_hunk(false, cx)))))
+                    .child(Self::button("prev", "↑ 前の差分", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.step_hunk(-1, cx)))))
                     .child(Self::button("next", "↓ 次の差分", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.step_hunk(1, cx)))))
+                    .child(Self::button("last", "⤓ 末尾", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.goto_edge_hunk(true, cx)))))
             })
             .when(in_file || in_folder, |d| {
                 d.child(Self::button("copy-r", "左→右", can_copy).when(can_copy, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_current(Side::Right, cx)))))
@@ -690,7 +751,7 @@ impl DiffHarbor {
 
     /// 片側のペインで本文に使える幅（行番号欄を除く）。
     fn pane_text_width(window: &Window) -> f32 {
-        ((f32::from(window.viewport_size().width) - MID_W) / 2.0 - GUTTER_W).max(1.0)
+        ((f32::from(window.viewport_size().width) - LOC_W - MID_W) / 2.0 - GUTTER_W).max(1.0)
     }
 
     /// 横方向にスクロールする。`dx` はホイールの移動量で、正なら左へ戻る。
@@ -807,10 +868,12 @@ impl DiffHarbor {
             .child(div().w(px(MID_W)).flex_none())
             .child(pane_status(&f.right));
 
-        div()
+        let panes = div()
             .flex()
             .flex_col()
-            .size_full()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                 let d = ev.delta.pixel_delta(px(ROW_H));
                 let (dx, dy) = (f32::from(d.x), f32::from(d.y));
@@ -821,7 +884,94 @@ impl DiffHarbor {
             .child(header)
             .child(body)
             .child(scroll_bar)
-            .child(status)
+            .child(status);
+
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .child(self.render_location(cx))
+            .child(panes)
+            .into_any_element()
+    }
+
+    /// 左端の位置ペイン。左右のファイルを 1 本ずつのバーで表し、差分の位置と表示範囲を示す。
+    fn render_location(&self, cx: &mut Context<Self>) -> AnyElement {
+        let View::File(f) = &self.view else { return div().into_any_element() };
+        let (diff, current, computing) = (f.diff.clone(), f.current, f.computing);
+        // 一覧のスクロール位置。前のフレームで確定した値を使う。
+        let (top_row, visible_rows) = {
+            let state = self.diff_scroll.0.borrow();
+            let offset_y = -f32::from(state.base_handle.offset().y);
+            let view_h = f32::from(state.base_handle.bounds().size.height);
+            (offset_y / ROW_H, view_h / ROW_H)
+        };
+        let geom = self.loc_geom.clone();
+
+        let bars = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let avail = f32::from(bounds.size.height) - LOC_PAD * 2.0;
+                let lay = if computing {
+                    location::LocationLayout::default()
+                } else {
+                    location::layout(&diff, current, avail, top_row, visible_rows)
+                };
+                let y0 = bounds.origin.y + px(LOC_PAD);
+                geom.set((lay.bar_h > 0.0).then_some((f32::from(y0), lay.bar_h)));
+                if lay.bar_h <= 0.0 {
+                    return;
+                }
+                for (i, bands) in [&lay.left, &lay.right].into_iter().enumerate() {
+                    let x = bounds.origin.x + px(8.0 + i as f32 * 17.0);
+                    window.paint_quad(quad(
+                        Bounds::new(point(x - px(1.), y0 - px(1.)), size(px(13.), px(lay.bar_h + 2.0))),
+                        Corners::all(px(0.)),
+                        rgb(BG),
+                        Edges::all(px(1.)),
+                        rgb(BORDER),
+                        BorderStyle::default(),
+                    ));
+                    for b in bands {
+                        window.paint_quad(fill(
+                            Bounds::new(point(x, y0 + px(b.top)), size(px(11.), px(b.height))),
+                            rgb(b.color),
+                        ));
+                    }
+                }
+                // 表示範囲の枠。
+                window.paint_quad(quad(
+                    Bounds::new(point(bounds.origin.x + px(3.), y0 + px(lay.view_top)), size(px(LOC_W - 7.0), px(lay.view_h))),
+                    Corners::all(px(1.)),
+                    Hsla::from(rgba(0x3B78D826)),
+                    Edges::all(px(1.)),
+                    rgb(ACCENT),
+                    BorderStyle::default(),
+                ));
+            },
+        )
+        .size_full();
+
+        div()
+            .id("location-pane")
+            .w(px(LOC_W))
+            .flex_none()
+            .h_full()
+            .bg(rgb(PANEL))
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| this.jump_to_location(f32::from(ev.position.y), cx)),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                // 押したまま動かすと、位置に追従してスクロールする。
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    this.jump_to_location(f32::from(ev.position.y), cx);
+                }
+            }))
+            .child(bars)
             .into_any_element()
     }
 
@@ -1038,6 +1188,16 @@ impl Render for DiffHarbor {
             self.title = title;
         }
 
+        // 右下に出す「差分 n / m」。
+        let counter = match &self.view {
+            View::File(f) if !f.computing => match (f.current, f.diff.hunks.len()) {
+                (_, 0) => String::new(),
+                (Some(c), n) => format!("差分 {} / {}", c + 1, n),
+                (None, n) => format!("差分 {n} 件"),
+            },
+            _ => String::new(),
+        };
+
         let body = match &self.view {
             View::Empty => div()
                 .size_full()
@@ -1058,6 +1218,8 @@ impl Render for DiffHarbor {
             .on_action(cx.listener(|t, _: &OpenRight, _, cx| t.pick(Side::Right, cx)))
             .on_action(cx.listener(|t, _: &NextDiff, _, cx| t.step_hunk(1, cx)))
             .on_action(cx.listener(|t, _: &PrevDiff, _, cx| t.step_hunk(-1, cx)))
+            .on_action(cx.listener(|t, _: &FirstDiff, _, cx| t.goto_edge_hunk(false, cx)))
+            .on_action(cx.listener(|t, _: &LastDiff, _, cx| t.goto_edge_hunk(true, cx)))
             .on_action(cx.listener(|t, _: &CopyToRight, _, cx| t.copy_current(Side::Right, cx)))
             .on_action(cx.listener(|t, _: &CopyToLeft, _, cx| t.copy_current(Side::Left, cx)))
             .on_action(cx.listener(|t, _: &Save, _, cx| t.save(cx)))
@@ -1074,6 +1236,9 @@ impl Render for DiffHarbor {
             .child(div().flex_1().min_h_0().child(body))
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
                     .px_3()
                     .py_1()
                     .bg(rgb(PANEL))
@@ -1081,7 +1246,8 @@ impl Render for DiffHarbor {
                     .border_color(rgb(BORDER))
                     .text_size(px(12.))
                     .text_color(rgb(DIM))
-                    .child(self.status.clone()),
+                    .child(self.status.clone())
+                    .child(div().flex_none().text_color(rgb(TEXT)).child(counter)),
             )
     }
 }

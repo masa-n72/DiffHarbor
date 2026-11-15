@@ -29,6 +29,7 @@ cargo run -- samples/ja/left_utf8.txt samples/ja/right_sjis.txt
 | --- | --- |
 | ⌘O / ⇧⌘O | 左 / 右を開く |
 | ⌥↓ / ⌥↑ | 次 / 前の差分 |
+| ⌥Home / ⌥End、または ⌥⌘↑ / ⌥⌘↓ | 先頭 / 末尾の差分 |
 | ⌥→ / ⌥← | 現在の差分を右 / 左へコピー |
 | ⌘S / ⌘Z | 保存 / 元に戻す |
 | ⌘R | フォルダ再比較 |
