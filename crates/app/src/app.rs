@@ -2,7 +2,7 @@
 
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -13,11 +13,14 @@ use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
     AnyElement, App, BorderStyle, Bounds, ClickEvent, Context, Corners, Edges, FocusHandle,
     HighlightStyle, Hsla, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
-    PathPromptOptions, Render, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
+    PathPromptOptions, PromptLevel, Render, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
     StyledText, UniformListScrollHandle, Window,
 };
 
-use diff_core::{apply_hunk, diff_lines, diff_lines_deadline, token_spans, DiffResult, RowKind};
+use diff_core::{
+    diff_lines, diff_lines_deadline, token_spans, DiffResult, Encoding, History, RowKind, Side, EUC_JP,
+    SHIFT_JIS, UTF_8,
+};
 
 use crate::{
     display::{display_width, expand_tabs},
@@ -39,11 +42,24 @@ actions!(
         LastDiff,
         CopyToRight,
         CopyToLeft,
+        CopyAllToRight,
+        CopyAllToLeft,
         Save,
+        SaveLeftAs,
+        SaveRightAs,
         Undo,
+        Redo,
         Refresh,
         Back,
         CloseWindow,
+        ReopenLeftAuto,
+        ReopenLeftUtf8,
+        ReopenLeftShiftJis,
+        ReopenLeftEucJp,
+        ReopenRightAuto,
+        ReopenRightUtf8,
+        ReopenRightShiftJis,
+        ReopenRightEucJp,
     ]
 );
 
@@ -63,6 +79,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-left", CopyToLeft, None),
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("cmd-z", Undo, None),
+        KeyBinding::new("cmd-shift-z", Redo, None),
         KeyBinding::new("cmd-r", Refresh, None),
         KeyBinding::new("cmd-[", Back, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
@@ -80,6 +97,8 @@ pub fn init(cx: &mut App) {
                 MenuItem::action("右を開く…", OpenRight),
                 MenuItem::separator(),
                 MenuItem::action("保存", Save),
+                MenuItem::action("左を別名で保存…", SaveLeftAs),
+                MenuItem::action("右を別名で保存…", SaveRightAs),
                 MenuItem::separator(),
                 MenuItem::action("フォルダを再比較", Refresh),
                 MenuItem::action("フォルダ一覧へ戻る", Back),
@@ -97,8 +116,25 @@ pub fn init(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("右へコピー", CopyToRight),
                 MenuItem::action("左へコピー", CopyToLeft),
+                MenuItem::action("すべて右へコピー", CopyAllToRight),
+                MenuItem::action("すべて左へコピー", CopyAllToLeft),
                 MenuItem::separator(),
                 MenuItem::action("元に戻す", Undo),
+                MenuItem::action("やり直す", Redo),
+            ],
+        },
+        Menu {
+            name: "文字コード".into(),
+            items: vec![
+                MenuItem::action("左を自動判定で開き直す", ReopenLeftAuto),
+                MenuItem::action("左を UTF-8 で開き直す", ReopenLeftUtf8),
+                MenuItem::action("左を Shift_JIS で開き直す", ReopenLeftShiftJis),
+                MenuItem::action("左を EUC-JP で開き直す", ReopenLeftEucJp),
+                MenuItem::separator(),
+                MenuItem::action("右を自動判定で開き直す", ReopenRightAuto),
+                MenuItem::action("右を UTF-8 で開き直す", ReopenRightUtf8),
+                MenuItem::action("右を Shift_JIS で開き直す", ReopenRightShiftJis),
+                MenuItem::action("右を EUC-JP で開き直す", ReopenRightEucJp),
             ],
         },
     ]);
@@ -129,6 +165,17 @@ const TOKEN_DIFF_MAX_BYTES: usize = 2000;
 
 type Spans = Rc<(Vec<Range<usize>>, Vec<Range<usize>>)>;
 
+/// 開発時の確認用。デバッグビルドでは DIFFHARBOR_DEBUG_ACTIONS にカンマ区切りで操作を並べられる。
+fn debug_actions() -> VecDeque<String> {
+    if cfg!(debug_assertions) {
+        std::env::var("DIFFHARBOR_DEBUG_ACTIONS")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    } else {
+        VecDeque::new()
+    }
+}
+
 /// 開発時の確認用。デバッグビルドでは DIFFHARBOR_DEBUG_HUNK で最初に選択する差分（0 始まり）を指定できる。
 fn debug_initial_hunk() -> usize {
     if cfg!(debug_assertions) {
@@ -145,12 +192,6 @@ fn debug_initial_h_scroll() -> f32 {
     } else {
         0.0
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Left,
-    Right,
 }
 
 #[derive(Clone)]
@@ -188,11 +229,15 @@ impl FolderView {
     }
 }
 
-struct Snapshot {
-    left: Vec<String>,
-    right: Vec<String>,
-    left_dirty: bool,
-    right_dirty: bool,
+/// 未保存の変更を確認した後に実行する操作。
+enum Pending {
+    CloseWindow,
+    Quit,
+    /// `side` に別のファイルやフォルダを開く。
+    Open(Side, PathBuf),
+    Back,
+    /// `side` を指定の文字コード（None は自動判定）で開き直す。
+    Reopen(Side, Option<&'static Encoding>),
 }
 
 struct FileView {
@@ -201,7 +246,8 @@ struct FileView {
     /// 位置ペインの描画と共有するので Rc で持つ。
     diff: Rc<DiffResult>,
     current: Option<usize>,
-    undo: Vec<Snapshot>,
+    /// コピー操作の履歴。元に戻す、やり直すに使う。
+    history: History,
     back: Option<Box<FolderView>>,
     /// 差分を別スレッドで計算中か。計算中は行の一覧を出さない。
     computing: bool,
@@ -217,13 +263,13 @@ struct FileView {
 
 impl FileView {
     fn new(left: &Path, right: &Path, back: Option<Box<FolderView>>) -> anyhow::Result<Self> {
-        let (left, right) = (Document::load(left)?, Document::load(right)?);
+        let (left, right) = (Document::load(left, None)?, Document::load(right, None)?);
         Ok(Self {
             left,
             right,
             diff: Rc::new(DiffResult::default()),
             current: None,
-            undo: Vec::new(),
+            history: History::new(),
             back,
             computing: false,
             generation: 0,
@@ -245,13 +291,34 @@ impl FileView {
         };
     }
 
-    fn snapshot(&mut self) {
-        self.undo.push(Snapshot {
-            left: self.left.lines.clone(),
-            right: self.right.lines.clone(),
-            left_dirty: self.left.dirty,
-            right_dirty: self.right.dirty,
-        });
+    fn doc(&self, side: Side) -> &Document {
+        match side {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        }
+    }
+
+    fn doc_mut(&mut self, side: Side) -> &mut Document {
+        match side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        }
+    }
+
+    /// 履歴の版と保存時の版を比べて、未保存フラグを更新する。
+    fn sync_dirty(&mut self) {
+        self.left.dirty = self.history.rev(Side::Left) != self.left.saved_rev;
+        self.right.dirty = self.history.rev(Side::Right) != self.right.saved_rev;
+    }
+
+    fn mark_saved(&mut self, side: Side) {
+        let rev = self.history.rev(side);
+        self.doc_mut(side).saved_rev = rev;
+        self.sync_dirty();
+    }
+
+    fn has_unsaved(&self) -> bool {
+        self.left.dirty || self.right.dirty
     }
 
     /// 表示行 `ix` が変更行なら、行内の差分を計算して覚えておく。
@@ -291,6 +358,10 @@ pub struct DiffHarbor {
     char_w: Option<f32>,
     /// 位置ペインのバーの (上端の y 座標, 高さ)。描画時に記録し、クリック位置の計算に使う。
     loc_geom: Rc<Cell<Option<(f32, f32)>>>,
+    /// 未保存の確認を済ませて、ウィンドウを閉じてよい状態か。
+    allow_close: bool,
+    /// 開発時の確認用。差分の計算が終わるたびに 1 つずつ実行する操作。
+    debug_actions: VecDeque<String>,
 }
 
 impl DiffHarbor {
@@ -309,7 +380,22 @@ impl DiffHarbor {
             title: String::new(),
             char_w: None,
             loc_geom: Rc::new(Cell::new(None)),
+            allow_close: false,
+            debug_actions: debug_actions(),
         };
+        // 閉じるボタンで閉じる時も、未保存の変更を確認する。
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |this, cx| {
+                if this.allow_close || !this.has_unsaved() {
+                    true
+                } else {
+                    this.guard(Pending::CloseWindow, window, cx);
+                    false
+                }
+            })
+            .unwrap_or(true)
+        });
         if let [l, r, ..] = args.as_slice() {
             this.left_path = Some(l.clone());
             this.right_path = Some(r.clone());
@@ -323,7 +409,63 @@ impl DiffHarbor {
         cx.notify();
     }
 
-    fn pick(&mut self, side: Side, cx: &mut Context<Self>) {
+    fn has_unsaved(&self) -> bool {
+        matches!(&self.view, View::File(f) if f.has_unsaved())
+    }
+
+    /// 未保存の変更があれば確認してから `pending` を実行する。なければすぐ実行する。
+    fn guard(&mut self, pending: Pending, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = match (&pending, &self.view) {
+            // 開き直しで失われるのは、その側の変更だけ。
+            (Pending::Reopen(side, _), View::File(f)) => f.doc(*side).dirty,
+            _ => self.has_unsaved(),
+        };
+        if !unsaved {
+            self.run(pending, window, cx);
+            return;
+        }
+        let rx = window.prompt(
+            PromptLevel::Warning,
+            "変更が保存されていません",
+            Some("保存しない場合、マージした内容は失われます。"),
+            &["保存", "保存しない", "キャンセル"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = rx.await else { return };
+            this.update_in(cx, |this, window, cx| match answer {
+                0 => match this.save_all() {
+                    Ok(_) => this.run(pending, window, cx),
+                    Err(e) => this.set_status(e, cx),
+                },
+                1 => this.run(pending, window, cx),
+                _ => {}
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run(&mut self, pending: Pending, window: &mut Window, cx: &mut Context<Self>) {
+        match pending {
+            Pending::CloseWindow => {
+                self.allow_close = true;
+                window.remove_window();
+            }
+            Pending::Quit => cx.quit(),
+            Pending::Open(side, path) => {
+                match side {
+                    Side::Left => self.left_path = Some(path),
+                    Side::Right => self.right_path = Some(path),
+                }
+                self.compare(cx);
+            }
+            Pending::Back => self.back_now(cx),
+            Pending::Reopen(side, enc) => self.reopen(side, enc, cx),
+        }
+    }
+
+    fn pick(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,
@@ -336,17 +478,11 @@ impl DiffHarbor {
                 .into(),
             ),
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(path) = paths.into_iter().next() {
-                    this.update(cx, |this, cx| {
-                        match side {
-                            Side::Left => this.left_path = Some(path),
-                            Side::Right => this.right_path = Some(path),
-                        }
-                        this.compare(cx);
-                    })
-                    .ok();
+                    // 開く対象が決まってから、未保存の変更を確認する。
+                    this.update_in(cx, |this, window, cx| this.guard(Pending::Open(side, path), window, cx)).ok();
                 }
             }
         })
@@ -424,6 +560,7 @@ impl DiffHarbor {
         }
         self.scroll_to_current();
         cx.notify();
+        self.run_debug_action(cx);
     }
 
     // ---- folder actions ----
@@ -579,17 +716,9 @@ impl DiffHarbor {
             return;
         }
         let Some(h) = f.diff.hunks.get(hunk).cloned() else { return };
-        f.snapshot();
-        match to {
-            Side::Right => {
-                apply_hunk(&mut f.right.lines, h.right, &f.left.lines, h.left);
-                f.right.dirty = true;
-            }
-            Side::Left => {
-                apply_hunk(&mut f.left.lines, h.left, &f.right.lines, h.right);
-                f.left.dirty = true;
-            }
-        }
+        f.history.copy_hunks(&mut f.left.file.lines, &mut f.right.file.lines, &[h], to);
+        f.sync_dirty();
+        // 同じ番号を選んでおくと、再計算後は次の差分が選択される。
         f.current = Some(hunk);
         self.start_diff(cx);
     }
@@ -606,57 +735,142 @@ impl DiffHarbor {
         }
     }
 
+    /// すべての差分を `to` の側へコピーする。1 回の操作として元に戻せる。
+    fn copy_all(&mut self, to: Side, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        if f.computing || f.diff.hunks.is_empty() {
+            return;
+        }
+        let diff = f.diff.clone();
+        f.history.copy_hunks(&mut f.left.file.lines, &mut f.right.file.lines, &diff.hunks, to);
+        f.sync_dirty();
+        self.start_diff(cx);
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         let View::File(f) = &mut self.view else { return };
         if f.computing {
             return;
         }
-        let Some(s) = f.undo.pop() else {
+        if f.history.undo(&mut f.left.file.lines, &mut f.right.file.lines).is_none() {
             self.set_status("元に戻す操作がありません", cx);
             return;
-        };
-        f.left.lines = s.left;
-        f.right.lines = s.right;
-        f.left.dirty = s.left_dirty;
-        f.right.dirty = s.right_dirty;
+        }
+        f.sync_dirty();
         self.start_diff(cx);
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn redo(&mut self, cx: &mut Context<Self>) {
         let View::File(f) = &mut self.view else { return };
+        if f.computing {
+            return;
+        }
+        if f.history.redo(&mut f.left.file.lines, &mut f.right.file.lines).is_none() {
+            self.set_status("やり直す操作がありません", cx);
+            return;
+        }
+        f.sync_dirty();
+        self.start_diff(cx);
+    }
+
+    /// 未保存の側をすべて保存する。保存したファイル名を返す。
+    fn save_all(&mut self) -> Result<Vec<String>, String> {
+        let View::File(f) = &mut self.view else { return Ok(Vec::new()) };
         let mut saved = Vec::new();
-        let mut error = None;
-        for doc in [&mut f.left, &mut f.right] {
-            if !doc.dirty {
+        for side in [Side::Left, Side::Right] {
+            if !f.doc(side).dirty {
                 continue;
             }
-            match doc.save() {
-                Ok(()) => saved.push(
-                    doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                ),
-                Err(e) => {
-                    error = Some(e.to_string());
-                    break;
-                }
-            }
+            f.doc(side).write().map_err(|e| e.to_string())?;
+            f.mark_saved(side);
+            saved.push(f.doc(side).file_name());
         }
-        let msg = match error {
-            Some(e) => e,
-            None if saved.is_empty() => "変更はありません".to_string(),
-            None => format!("保存しました: {}", saved.join(", ")),
+        Ok(saved)
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let msg = match self.save_all() {
+            Err(e) => e,
+            Ok(saved) if saved.is_empty() => "変更はありません".to_string(),
+            Ok(saved) => format!("保存しました: {}", saved.join(", ")),
         };
         self.set_status(msg, cx);
     }
 
-    fn back(&mut self, cx: &mut Context<Self>) {
-        if let View::File(f) = &mut self.view {
-            if f.left.dirty || f.right.dirty {
-                self.set_status("未保存の変更があります。⌘S で保存してください", cx);
-                return;
+    /// `side` の内容を別のファイルへ保存する。以後はそのファイルを比較対象にする。
+    fn save_as(&mut self, side: Side, cx: &mut Context<Self>) {
+        let View::File(f) = &self.view else { return };
+        let doc = f.doc(side);
+        let dir = doc.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let rx = cx.prompt_for_new_path(&dir, Some(&doc.file_name()));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                this.update(cx, |this, cx| this.finish_save_as(side, path, cx)).ok();
             }
+        })
+        .detach();
+    }
+
+    fn finish_save_as(&mut self, side: Side, path: PathBuf, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        if let Err(e) = diff_core::save(&path, &f.doc(side).file) {
+            self.set_status(e.to_string(), cx);
+            return;
+        }
+        f.doc_mut(side).path = path.clone();
+        f.mark_saved(side);
+        let name = f.doc(side).file_name();
+        match side {
+            Side::Left => self.left_path = Some(path),
+            Side::Right => self.right_path = Some(path),
+        }
+        self.set_status(format!("保存しました: {name}"), cx);
+    }
+
+    /// `side` を読み直す。`enc` が None なら文字コードを自動判定する。その側の履歴は捨てる。
+    fn reopen(&mut self, side: Side, enc: Option<&'static Encoding>, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        if f.computing {
+            return;
+        }
+        let path = f.doc(side).path.clone();
+        match Document::load(&path, enc) {
+            Ok(doc) => {
+                *f.doc_mut(side) = doc;
+                f.history.reset(side);
+                f.mark_saved(side);
+                self.start_diff(cx);
+            }
+            Err(e) => self.set_status(e.to_string(), cx),
+        }
+    }
+
+    /// フォルダ一覧へ戻る。未保存の確認は済んでいること。
+    fn back_now(&mut self, cx: &mut Context<Self>) {
+        if let View::File(f) = &mut self.view {
             if let Some(folder) = f.back.take() {
                 self.view = View::Folder(*folder);
                 self.refresh(cx);
+            }
+        }
+    }
+
+    /// 開発時の確認用。DIFFHARBOR_DEBUG_ACTIONS に並べた操作を、差分の計算が終わるたびに 1 つ実行する。
+    fn run_debug_action(&mut self, cx: &mut Context<Self>) {
+        while let Some(action) = self.debug_actions.pop_front() {
+            match action.as_str() {
+                "copy_right" => return self.copy_current(Side::Right, cx),
+                "copy_left" => return self.copy_current(Side::Left, cx),
+                "copy_all_right" => return self.copy_all(Side::Right, cx),
+                "copy_all_left" => return self.copy_all(Side::Left, cx),
+                "undo" => return self.undo(cx),
+                "redo" => return self.redo(cx),
+                "reopen_right_sjis" => return self.reopen(Side::Right, Some(SHIFT_JIS), cx),
+                "reopen_right_utf8" => return self.reopen(Side::Right, Some(UTF_8), cx),
+                // 差分の再計算を伴わない操作は、続けて次を実行する。
+                "save" => self.save(cx),
+                "next" => self.step_hunk(1, cx),
+                other => eprintln!("unknown debug action: {other}"),
             }
         }
     }
@@ -684,7 +898,8 @@ impl DiffHarbor {
         let has_back = matches!(&self.view, View::File(f) if f.back.is_some());
         let has_hunks = matches!(&self.view, View::File(f) if !f.diff.hunks.is_empty());
         let can_copy = has_hunks || matches!(&self.view, View::Folder(f) if f.selected.is_some());
-        let can_undo = matches!(&self.view, View::File(f) if !f.undo.is_empty());
+        let can_undo = matches!(&self.view, View::File(f) if f.history.can_undo());
+        let can_redo = matches!(&self.view, View::File(f) if f.history.can_redo());
         let can_save = matches!(&self.view, View::File(f) if f.left.dirty || f.right.dirty);
 
         div()
@@ -697,11 +912,11 @@ impl DiffHarbor {
             .bg(rgb(PANEL))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(Self::button("open-left", "左を開く…", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.pick(Side::Left, cx))))
-            .child(Self::button("open-right", "右を開く…", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.pick(Side::Right, cx))))
+            .child(Self::button("open-left", "左を開く…", true).on_click(cx.listener(|t, _: &ClickEvent, window, cx| t.pick(Side::Left, window, cx))))
+            .child(Self::button("open-right", "右を開く…", true).on_click(cx.listener(|t, _: &ClickEvent, window, cx| t.pick(Side::Right, window, cx))))
             .child(div().w(px(1.)).h(px(18.)).bg(rgb(BORDER)))
             .when(has_back, |d| {
-                d.child(Self::button("back", "← フォルダへ", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.back(cx))))
+                d.child(Self::button("back", "← フォルダへ", true).on_click(cx.listener(|t, _: &ClickEvent, window, cx| t.guard(Pending::Back, window, cx))))
             })
             .when(in_file, |d| {
                 d.child(Self::button("first", "⤒ 先頭", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.goto_edge_hunk(false, cx)))))
@@ -712,9 +927,14 @@ impl DiffHarbor {
             .when(in_file || in_folder, |d| {
                 d.child(Self::button("copy-r", "左→右", can_copy).when(can_copy, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_current(Side::Right, cx)))))
                     .child(Self::button("copy-l", "右→左", can_copy).when(can_copy, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_current(Side::Left, cx)))))
+                    .when(in_file, |d| {
+                        d.child(Self::button("copy-all-r", "すべて右へ", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_all(Side::Right, cx)))))
+                            .child(Self::button("copy-all-l", "すべて左へ", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_all(Side::Left, cx)))))
+                    })
             })
             .when(in_file, |d| {
                 d.child(Self::button("undo", "元に戻す", can_undo).when(can_undo, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.undo(cx)))))
+                    .child(Self::button("redo", "やり直す", can_redo).when(can_redo, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.redo(cx)))))
                     .child(Self::button("save", "保存", can_save).when(can_save, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.save(cx)))))
             })
             .when(in_folder, |d| {
@@ -791,10 +1011,11 @@ impl DiffHarbor {
         // ウィンドウを広げた時に、スクロール位置が範囲外に残らないようにする。
         f.h_scroll = f.h_scroll.min((content_w - pane_w).max(0.0));
 
-        let mark = |d: &Document| if d.dirty { " ●" } else { "" };
+        // 未保存の印は先頭に付ける。長いパスが切れても見えるようにする。
+        let mark = |d: &Document| if d.dirty { "● " } else { "" };
         let header = Self::path_header(
-            format!("{}{}", f.left.path.display(), mark(&f.left)),
-            format!("{}{}", f.right.path.display(), mark(&f.right)),
+            format!("{}{}", mark(&f.left), f.left.path.display()),
+            format!("{}{}", mark(&f.right), f.right.path.display()),
         );
 
         let body = if f.computing {
@@ -1214,8 +1435,22 @@ impl Render for DiffHarbor {
         div()
             .key_context("DiffHarbor")
             .track_focus(&self.focus)
-            .on_action(cx.listener(|t, _: &OpenLeft, _, cx| t.pick(Side::Left, cx)))
-            .on_action(cx.listener(|t, _: &OpenRight, _, cx| t.pick(Side::Right, cx)))
+            .on_action(cx.listener(|t, _: &OpenLeft, window, cx| t.pick(Side::Left, window, cx)))
+            .on_action(cx.listener(|t, _: &OpenRight, window, cx| t.pick(Side::Right, window, cx)))
+            .on_action(cx.listener(|t, _: &Quit, window, cx| t.guard(Pending::Quit, window, cx)))
+            .on_action(cx.listener(|t, _: &CopyAllToRight, _, cx| t.copy_all(Side::Right, cx)))
+            .on_action(cx.listener(|t, _: &CopyAllToLeft, _, cx| t.copy_all(Side::Left, cx)))
+            .on_action(cx.listener(|t, _: &Redo, _, cx| t.redo(cx)))
+            .on_action(cx.listener(|t, _: &SaveLeftAs, _, cx| t.save_as(Side::Left, cx)))
+            .on_action(cx.listener(|t, _: &SaveRightAs, _, cx| t.save_as(Side::Right, cx)))
+            .on_action(cx.listener(|t, _: &ReopenLeftAuto, w, cx| t.guard(Pending::Reopen(Side::Left, None), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenLeftUtf8, w, cx| t.guard(Pending::Reopen(Side::Left, Some(UTF_8)), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenLeftShiftJis, w, cx| t.guard(Pending::Reopen(Side::Left, Some(SHIFT_JIS)), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenLeftEucJp, w, cx| t.guard(Pending::Reopen(Side::Left, Some(EUC_JP)), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenRightAuto, w, cx| t.guard(Pending::Reopen(Side::Right, None), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenRightUtf8, w, cx| t.guard(Pending::Reopen(Side::Right, Some(UTF_8)), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenRightShiftJis, w, cx| t.guard(Pending::Reopen(Side::Right, Some(SHIFT_JIS)), w, cx)))
+            .on_action(cx.listener(|t, _: &ReopenRightEucJp, w, cx| t.guard(Pending::Reopen(Side::Right, Some(EUC_JP)), w, cx)))
             .on_action(cx.listener(|t, _: &NextDiff, _, cx| t.step_hunk(1, cx)))
             .on_action(cx.listener(|t, _: &PrevDiff, _, cx| t.step_hunk(-1, cx)))
             .on_action(cx.listener(|t, _: &FirstDiff, _, cx| t.goto_edge_hunk(false, cx)))
@@ -1225,8 +1460,8 @@ impl Render for DiffHarbor {
             .on_action(cx.listener(|t, _: &Save, _, cx| t.save(cx)))
             .on_action(cx.listener(|t, _: &Undo, _, cx| t.undo(cx)))
             .on_action(cx.listener(|t, _: &Refresh, _, cx| t.refresh(cx)))
-            .on_action(cx.listener(|t, _: &Back, _, cx| t.back(cx)))
-            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(cx.listener(|t, _: &Back, window, cx| t.guard(Pending::Back, window, cx)))
+            .on_action(cx.listener(|t, _: &CloseWindow, window, cx| t.guard(Pending::CloseWindow, window, cx)))
             .flex()
             .flex_col()
             .size_full()

@@ -1,4 +1,4 @@
-//! 画面側で扱う 1 ファイル。diff-core の `TextFile` にパスと変更フラグを足したもの。
+//! 画面側で扱う 1 ファイル。diff-core の `TextFile` にパスと保存状態を足したもの。
 
 use std::{
     ops::{Deref, DerefMut},
@@ -6,24 +6,31 @@ use std::{
 };
 
 use anyhow::Result;
-use diff_core::TextFile;
+use diff_core::{Encoding, TextFile};
 
 #[derive(Clone)]
 pub struct Document {
     pub path: PathBuf,
     pub file: TextFile,
+    /// 未保存の変更があるか。履歴の版と `saved_rev` から求めた値を入れておく。
     pub dirty: bool,
+    /// 最後に保存した（または読み込んだ）時点の版。
+    pub saved_rev: u64,
 }
 
 impl Document {
-    pub fn load(path: &Path) -> Result<Self> {
-        Ok(Self { path: path.to_path_buf(), file: diff_core::load(path, None)?, dirty: false })
+    /// 読み込む。`force` があればその文字コードで読む。
+    pub fn load(path: &Path, force: Option<&'static Encoding>) -> Result<Self> {
+        Ok(Self { path: path.to_path_buf(), file: diff_core::load(path, force)?, dirty: false, saved_rev: 0 })
     }
 
-    pub fn save(&mut self) -> Result<()> {
-        diff_core::save(&self.path, &self.file)?;
-        self.dirty = false;
-        Ok(())
+    /// 現在のパスへ書き込む。保存状態の更新は呼び出し側で行う。
+    pub fn write(&self) -> Result<()> {
+        diff_core::save(&self.path, &self.file)
+    }
+
+    pub fn file_name(&self) -> String {
+        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
 }
 

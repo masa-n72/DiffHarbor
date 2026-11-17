@@ -55,3 +55,39 @@ fn binary_file_exits_two() {
     fs::write(&r, "x\n").unwrap();
     assert_eq!(dhdiff(&[&l, &r]).0, 2);
 }
+
+/// 段階 1 の完了条件。Shift_JIS のファイルをマージして保存しても、
+/// 文字コード、改行コード、BOM が変わらない。
+#[test]
+fn merge_and_save_keeps_encoding_eol_and_bom() {
+    use diff_core::{diff_lines, load, save, History, Side, SHIFT_JIS};
+
+    let dir = tmp_dir("merge");
+    let (lp, rp) = (dir.join("utf8_bom.txt"), dir.join("sjis.txt"));
+    let left = "設定ファイルの説明です。\n今日は晴れです。\n文字コードが違っても比較できます。\n左だけにある行です。\n";
+    let right = "設定ファイルの説明です。\r\n今日は雨です。\r\n文字コードが違っても比較できます。\r\n";
+    let mut left_bytes = vec![0xEF, 0xBB, 0xBF];
+    left_bytes.extend_from_slice(left.as_bytes());
+    fs::write(&lp, &left_bytes).unwrap();
+    fs::write(&rp, SHIFT_JIS.encode(right).0).unwrap();
+
+    let (mut l, mut r) = (load(&lp, None).unwrap(), load(&rp, None).unwrap());
+    let mut history = History::new();
+    let d = diff_lines(&l.lines, &r.lines);
+    assert_eq!(d.hunks.len(), 2);
+    // すべて右へコピーして保存する。
+    history.copy_hunks(&mut l.lines, &mut r.lines, &d.hunks, Side::Right);
+    save(&rp, &r).unwrap();
+
+    // 右は Shift_JIS、CRLF のまま、内容は左と同じになる。
+    let expected = SHIFT_JIS.encode(&left.replace('\n', "\r\n")).0.into_owned();
+    assert_eq!(fs::read(&rp).unwrap(), expected);
+    // 左は触っていないので、BOM 付き UTF-8、LF のまま。
+    save(&lp, &l).unwrap();
+    assert_eq!(fs::read(&lp).unwrap(), left_bytes);
+
+    let (code, out) = dhdiff(&[&lp, &rp]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("[UTF-8 (BOM) / LF]"), "{out}");
+    assert!(out.contains("[Shift_JIS (推定) / CRLF]"), "{out}");
+}
