@@ -1,4 +1,4 @@
-//! Recursive directory comparison and entry copying.
+//! フォルダの再帰比較と、項目のコピー。
 
 use std::{
     collections::BTreeMap,
@@ -28,7 +28,13 @@ pub struct FolderEntry {
     pub status: Status,
 }
 
-const IGNORED: &[&str] = &[".DS_Store", ".git"];
+/// 比較とコピーの対象から外す名前。
+const IGNORED: &[&str] = &[".DS_Store", ".git", "Thumbs.db", "desktop.ini"];
+
+/// 比較とコピーの対象から外すか。macOS が他のファイルシステムに作る `._*`（AppleDouble）も外す。
+pub fn is_ignored(name: &str) -> bool {
+    IGNORED.iter().any(|i| i.eq_ignore_ascii_case(name)) || name.starts_with("._")
+}
 
 pub fn compare_dirs(left: &Path, right: &Path) -> Result<Vec<FolderEntry>> {
     let mut out = Vec::new();
@@ -47,7 +53,7 @@ fn list(dir: &Path) -> Result<BTreeMap<String, bool>> {
     for e in fs::read_dir(dir).with_context(|| format!("開けません: {}", dir.display()))? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
-        if IGNORED.contains(&name.as_str()) {
+        if is_ignored(&name) {
             continue;
         }
         // Symlinks are treated as files and never followed into.
@@ -150,7 +156,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for e in fs::read_dir(src)? {
         let e = e?;
-        if IGNORED.contains(&e.file_name().to_string_lossy().as_ref()) {
+        if is_ignored(&e.file_name().to_string_lossy()) {
             continue;
         }
         let (s, d) = (e.path(), dst.join(e.file_name()));
@@ -197,6 +203,40 @@ mod tests {
         assert_eq!(find("sub"), Status::Different);
         // Directories come first.
         assert!(e[0].is_dir);
+    }
+
+    #[test]
+    fn ignores_os_metadata_files() {
+        let root = tmp("ignore");
+        let (l, r) = (root.join("l"), root.join("r"));
+        fs::create_dir_all(&l).unwrap();
+        fs::create_dir_all(&r).unwrap();
+        fs::write(l.join("a.txt"), "x").unwrap();
+        fs::write(r.join("a.txt"), "x").unwrap();
+        for name in [".DS_Store", "._a.txt", "Thumbs.db", "desktop.ini"] {
+            fs::write(l.join(name), "junk").unwrap();
+        }
+        fs::create_dir_all(r.join(".git")).unwrap();
+        let e = compare_dirs(&l, &r).unwrap();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].status, Status::Identical);
+
+        // コピーでも外す。
+        fs::create_dir_all(l.join("d")).unwrap();
+        fs::write(l.join("d/._x"), "junk").unwrap();
+        fs::write(l.join("d/x"), "x").unwrap();
+        copy_entry(&l, &r, Path::new("d")).unwrap();
+        assert!(r.join("d/x").exists());
+        assert!(!r.join("d/._x").exists());
+    }
+
+    #[test]
+    fn is_ignored_matches_names() {
+        assert!(is_ignored(".DS_Store"));
+        assert!(is_ignored("._main.rs"));
+        assert!(is_ignored("thumbs.db"));
+        assert!(!is_ignored("main.rs"));
+        assert!(!is_ignored(".gitignore"));
     }
 
     #[test]

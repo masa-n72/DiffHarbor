@@ -1,6 +1,6 @@
 # DiffHarbor
 
-gpui で作る macOS 向けの WinMerge 風 diff/merge ツール。
+gpui で作る macOS と Windows 向けの WinMerge 風 diff/merge ツール。
 
 ## 機能
 
@@ -13,7 +13,10 @@ gpui で作る macOS 向けの WinMerge 風 diff/merge ツール。
 
 ## ビルド
 
-Rust 1.98 以降と Xcode Command Line Tools があればビルドできます。
+Rust 1.98 以降が必要です。
+
+- macOS: Xcode Command Line Tools
+- Windows: MSVC 版の Rust（`x86_64-pc-windows-msvc`）と、Visual Studio Build Tools の「C++ によるデスクトップ開発」（MSVC と Windows SDK）。リリースビルドでは Windows SDK の `fxc.exe` を使います。見つからない場合は環境変数 `GPUI_FXC_PATH` に場所を指定します
 
 ```bash
 cargo run -- samples/ja/left_utf8.txt samples/ja/right_sjis.txt
@@ -27,14 +30,16 @@ cargo run -- samples/ja/left_utf8.txt samples/ja/right_sjis.txt
 
 ## キー操作
 
-| キー | 動作 |
-| --- | --- |
-| ⌘O / ⇧⌘O | 左 / 右を開く |
-| ⌥↓ / ⌥↑ | 次 / 前の差分 |
-| ⌥Home / ⌥End、または ⌥⌘↑ / ⌥⌘↓ | 先頭 / 末尾の差分 |
-| ⌥→ / ⌥← | 現在の差分を右 / 左へコピー |
-| ⌘S | 保存 |
-| ⌘Z / ⇧⌘Z | 元に戻す / やり直す |
-| ⌘W | ウインドウを閉じる |
-| ⌘R | フォルダ再比較 |
-| ⌘[ | フォルダ一覧へ戻る |
+| macOS | Windows | 動作 |
+| --- | --- | --- |
+| ⌘O / ⇧⌘O | Ctrl+O / Ctrl+Shift+O | 左 / 右を開く |
+| ⌥↓ / ⌥↑ | Alt+↓ / Alt+↑ | 次 / 前の差分 |
+| ⌥Home / ⌥End、または ⌥⌘↑ / ⌥⌘↓ | Alt+Home / Alt+End、または Ctrl+Alt+↑ / Ctrl+Alt+↓ | 先頭 / 末尾の差分 |
+| ⌥→ / ⌥← | Alt+→ / Alt+← | 現在の差分を右 / 左へコピー |
+| ⌘S | Ctrl+S | 保存 |
+| ⌘Z / ⇧⌘Z | Ctrl+Z / Ctrl+Shift+Z、Ctrl+Y | 元に戻す / やり直す |
+| ⌘W | Ctrl+W | ウインドウを閉じる |
+| ⌘R | Ctrl+R | フォルダ再比較 |
+| ⌘[ | Ctrl+[ | フォルダ一覧へ戻る |
+
+Windows ではメニューをウィンドウ上部に表示します。

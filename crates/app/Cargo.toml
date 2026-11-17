@@ -7,3 +7,7 @@ edition.workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 diff-core.workspace = true
+
+# Windows 用のマニフェスト（高 DPI 対応、確認ダイアログに使う Common Controls 6）を埋め込む。build.rs を参照。
+[build-dependencies]
+embed-resource = "3"

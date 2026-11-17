@@ -1,7 +1,9 @@
+// Windows のリリースビルドでは、起動時にコンソールウィンドウを出さない。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod display;
 mod document;
-mod folder;
 mod location;
 mod theme;
 

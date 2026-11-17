@@ -369,6 +369,30 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn save_on_windows_replaces_and_refuses_readonly() {
+        let dir = tmp_dir("save-win");
+        let path = dir.join("a.txt");
+        fs::write(&path, "old\r\n").unwrap();
+
+        let mut f = load(&path, None).unwrap();
+        f.lines = vec!["new".into(), "行".into()];
+        save(&path, &f).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\r\n行\r\n");
+        // 一時ファイルが残っていない。
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        let mut perm = fs::metadata(&path).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(&path, perm.clone()).unwrap();
+        f.lines[0] = "changed".into();
+        assert!(save(&path, &f).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\r\n行\r\n");
+        perm.set_readonly(false);
+        fs::set_permissions(&path, perm).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_through_symlink_keeps_the_link() {

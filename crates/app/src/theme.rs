@@ -44,4 +44,8 @@ pub const STATUS_RIGHT_ONLY: u32 = 0x1565C0;
 pub const STATUS_MISMATCH: u32 = 0x7B1FA2;
 
 /// 本文に使う等幅フォント。日本語は macOS のフォールバックで表示される。
+#[cfg(target_os = "macos")]
 pub const MONO_FONT: &str = "Menlo";
+/// Windows の等幅フォント。日本語は DirectWrite のフォールバックで表示する。
+#[cfg(not(target_os = "macos"))]
+pub const MONO_FONT: &str = "Consolas";

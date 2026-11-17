@@ -10,7 +10,7 @@ use std::{
 };
 
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
+    actions, canvas, deferred, div, fill, font, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
     AnyElement, App, BorderStyle, Bounds, ClickEvent, Context, Corners, Edges, FocusHandle,
     HighlightStyle, Hsla, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
     PathPromptOptions, PromptLevel, Render, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
@@ -18,15 +18,14 @@ use gpui::{
 };
 
 use diff_core::{
-    diff_lines, diff_lines_deadline, token_spans, DiffResult, Encoding, History, RowKind, Side, EUC_JP,
-    SHIFT_JIS, UTF_8,
+    compare_dirs, copy_entry, diff_lines, diff_lines_deadline, token_spans, DiffResult, Encoding, FolderEntry,
+    History, RowKind, Side, Status, EUC_JP, SHIFT_JIS, UTF_8,
 };
 
 use crate::{
     display::{display_width, expand_tabs},
     document::Document,
     theme::*,
-    folder::{compare_dirs, copy_entry, FolderEntry, Status},
     location,
 };
 
@@ -64,80 +63,33 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    // "secondary" は macOS では ⌘、Windows では Ctrl になる。
     cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-o", OpenLeft, None),
-        KeyBinding::new("cmd-shift-o", OpenRight, None),
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-o", OpenLeft, None),
+        KeyBinding::new("secondary-shift-o", OpenRight, None),
         KeyBinding::new("alt-down", NextDiff, None),
         KeyBinding::new("alt-up", PrevDiff, None),
         KeyBinding::new("alt-home", FirstDiff, None),
         KeyBinding::new("alt-end", LastDiff, None),
         // Home / End キーがないキーボード向け。
-        KeyBinding::new("alt-cmd-up", FirstDiff, None),
-        KeyBinding::new("alt-cmd-down", LastDiff, None),
+        KeyBinding::new("alt-secondary-up", FirstDiff, None),
+        KeyBinding::new("alt-secondary-down", LastDiff, None),
         KeyBinding::new("alt-right", CopyToRight, None),
         KeyBinding::new("alt-left", CopyToLeft, None),
-        KeyBinding::new("cmd-s", Save, None),
-        KeyBinding::new("cmd-z", Undo, None),
-        KeyBinding::new("cmd-shift-z", Redo, None),
-        KeyBinding::new("cmd-r", Refresh, None),
-        KeyBinding::new("cmd-[", Back, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-z", Undo, None),
+        KeyBinding::new("secondary-shift-z", Redo, None),
+        KeyBinding::new("secondary-r", Refresh, None),
+        KeyBinding::new("secondary-[", Back, None),
+        KeyBinding::new("secondary-w", CloseWindow, None),
     ]);
+    if !cfg!(target_os = "macos") {
+        // Windows の慣習に合わせた追加のキー。
+        cx.bind_keys([KeyBinding::new("ctrl-y", Redo, None)]);
+    }
     cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.set_menus(vec![
-        Menu {
-            name: "DiffHarbor".into(),
-            items: vec![MenuItem::action("DiffHarbor を終了", Quit)],
-        },
-        Menu {
-            name: "ファイル".into(),
-            items: vec![
-                MenuItem::action("左を開く…", OpenLeft),
-                MenuItem::action("右を開く…", OpenRight),
-                MenuItem::separator(),
-                MenuItem::action("保存", Save),
-                MenuItem::action("左を別名で保存…", SaveLeftAs),
-                MenuItem::action("右を別名で保存…", SaveRightAs),
-                MenuItem::separator(),
-                MenuItem::action("フォルダを再比較", Refresh),
-                MenuItem::action("フォルダ一覧へ戻る", Back),
-                MenuItem::separator(),
-                MenuItem::action("ウインドウを閉じる", CloseWindow),
-            ],
-        },
-        Menu {
-            name: "差分".into(),
-            items: vec![
-                MenuItem::action("次の差分", NextDiff),
-                MenuItem::action("前の差分", PrevDiff),
-                MenuItem::action("先頭の差分", FirstDiff),
-                MenuItem::action("末尾の差分", LastDiff),
-                MenuItem::separator(),
-                MenuItem::action("右へコピー", CopyToRight),
-                MenuItem::action("左へコピー", CopyToLeft),
-                MenuItem::action("すべて右へコピー", CopyAllToRight),
-                MenuItem::action("すべて左へコピー", CopyAllToLeft),
-                MenuItem::separator(),
-                MenuItem::action("元に戻す", Undo),
-                MenuItem::action("やり直す", Redo),
-            ],
-        },
-        Menu {
-            name: "文字コード".into(),
-            items: vec![
-                MenuItem::action("左を自動判定で開き直す", ReopenLeftAuto),
-                MenuItem::action("左を UTF-8 で開き直す", ReopenLeftUtf8),
-                MenuItem::action("左を Shift_JIS で開き直す", ReopenLeftShiftJis),
-                MenuItem::action("左を EUC-JP で開き直す", ReopenLeftEucJp),
-                MenuItem::separator(),
-                MenuItem::action("右を自動判定で開き直す", ReopenRightAuto),
-                MenuItem::action("右を UTF-8 で開き直す", ReopenRightUtf8),
-                MenuItem::action("右を Shift_JIS で開き直す", ReopenRightShiftJis),
-                MenuItem::action("右を EUC-JP で開き直す", ReopenRightEucJp),
-            ],
-        },
-    ]);
+    cx.set_menus(app_menus());
     cx.on_window_closed(|cx| {
         if cx.windows().is_empty() {
             cx.quit();
@@ -338,6 +290,78 @@ impl FileView {
     }
 }
 
+/// メニューバーに並べるメニュー。
+///
+/// macOS ではシステムのメニューバーに出す。Windows では gpui がメニューバーを描かないので、
+/// ウィンドウ上部にアプリ内のメニューバーとして描く（`render_menubar`）。
+fn app_menus() -> Vec<Menu> {
+    let mut file_items = vec![
+        MenuItem::action("左を開く…", OpenLeft),
+        MenuItem::action("右を開く…", OpenRight),
+        MenuItem::separator(),
+        MenuItem::action("保存", Save),
+        MenuItem::action("左を別名で保存…", SaveLeftAs),
+        MenuItem::action("右を別名で保存…", SaveRightAs),
+        MenuItem::separator(),
+        MenuItem::action("フォルダを再比較", Refresh),
+        MenuItem::action("フォルダ一覧へ戻る", Back),
+        MenuItem::separator(),
+        MenuItem::action("ウインドウを閉じる", CloseWindow),
+    ];
+    let mut menus = Vec::new();
+    if cfg!(target_os = "macos") {
+        menus.push(Menu {
+            name: "DiffHarbor".into(),
+            items: vec![MenuItem::action("DiffHarbor を終了", Quit)],
+        });
+    } else {
+        file_items.push(MenuItem::action("終了", Quit));
+    }
+    menus.push(Menu { name: "ファイル".into(), items: file_items });
+    menus.push(Menu {
+        name: "差分".into(),
+        items: vec![
+            MenuItem::action("次の差分", NextDiff),
+            MenuItem::action("前の差分", PrevDiff),
+            MenuItem::action("先頭の差分", FirstDiff),
+            MenuItem::action("末尾の差分", LastDiff),
+            MenuItem::separator(),
+            MenuItem::action("右へコピー", CopyToRight),
+            MenuItem::action("左へコピー", CopyToLeft),
+            MenuItem::action("すべて右へコピー", CopyAllToRight),
+            MenuItem::action("すべて左へコピー", CopyAllToLeft),
+            MenuItem::separator(),
+            MenuItem::action("元に戻す", Undo),
+            MenuItem::action("やり直す", Redo),
+        ],
+    });
+    menus.push(Menu {
+        name: "文字コード".into(),
+        items: vec![
+            MenuItem::action("左を自動判定で開き直す", ReopenLeftAuto),
+            MenuItem::action("左を UTF-8 で開き直す", ReopenLeftUtf8),
+            MenuItem::action("左を Shift_JIS で開き直す", ReopenLeftShiftJis),
+            MenuItem::action("左を EUC-JP で開き直す", ReopenLeftEucJp),
+            MenuItem::separator(),
+            MenuItem::action("右を自動判定で開き直す", ReopenRightAuto),
+            MenuItem::action("右を UTF-8 で開き直す", ReopenRightUtf8),
+            MenuItem::action("右を Shift_JIS で開き直す", ReopenRightShiftJis),
+            MenuItem::action("右を EUC-JP で開き直す", ReopenRightEucJp),
+        ],
+    });
+    menus
+}
+
+/// ウィンドウ内にメニューバーを描くか。macOS はシステムのメニューバーを使う。
+const IN_WINDOW_MENUBAR: bool = !cfg!(target_os = "macos");
+
+/// 起動直後に出す案内。
+const OPEN_HINT: &str = if cfg!(target_os = "macos") {
+    "左右のファイルまたはフォルダを開いてください (⌘O / ⇧⌘O)"
+} else {
+    "左右のファイルまたはフォルダを開いてください (Ctrl+O / Ctrl+Shift+O)"
+};
+
 enum View {
     Empty,
     Folder(FolderView),
@@ -362,6 +386,8 @@ pub struct DiffHarbor {
     allow_close: bool,
     /// 開発時の確認用。差分の計算が終わるたびに 1 つずつ実行する操作。
     debug_actions: VecDeque<String>,
+    /// アプリ内のメニューバーで開いているメニューの番号（Windows のみ使う）。
+    open_menu: Option<usize>,
 }
 
 impl DiffHarbor {
@@ -373,7 +399,7 @@ impl DiffHarbor {
             left_path: None,
             right_path: None,
             view: View::Empty,
-            status: "左右のファイルまたはフォルダを開いてください (⌘O / ⇧⌘O)".into(),
+            status: OPEN_HINT.into(),
             diff_scroll: UniformListScrollHandle::new(),
             folder_scroll: UniformListScrollHandle::new(),
             only_diffs: false,
@@ -382,6 +408,7 @@ impl DiffHarbor {
             loc_geom: Rc::new(Cell::new(None)),
             allow_close: false,
             debug_actions: debug_actions(),
+            open_menu: None,
         };
         // 閉じるボタンで閉じる時も、未保存の変更を確認する。
         let weak = cx.weak_entity();
@@ -890,6 +917,90 @@ impl DiffHarbor {
             .text_size(px(12.))
             .when(enabled, |b| b.cursor_pointer().hover(|s| s.bg(rgb(BUTTON_HOVER))))
             .child(label.to_string())
+    }
+
+    /// アプリ内のメニューバー（Windows 用）。項目を選ぶと、メニューと同じ操作を実行する。
+    fn render_menubar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_1()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(12.))
+            .text_color(rgb(TEXT));
+        for (i, menu) in app_menus().into_iter().enumerate() {
+            let open = self.open_menu == Some(i);
+            let mut title = div()
+                .id(("menu", i))
+                .relative()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(open, |d| d.bg(rgb(BUTTON_HOVER)))
+                .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+                .child(menu.name.clone())
+                .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| {
+                    t.open_menu = if t.open_menu == Some(i) { None } else { Some(i) };
+                    cx.notify();
+                }))
+                // メニューを開いている間は、ポインタを載せたメニューに切り替える。
+                .on_hover(cx.listener(move |t, hovered: &bool, _, cx| {
+                    if *hovered && t.open_menu.is_some() && t.open_menu != Some(i) {
+                        t.open_menu = Some(i);
+                        cx.notify();
+                    }
+                }));
+            if open {
+                title = title.child(deferred(Self::render_menu_items(menu.items, cx)).with_priority(2));
+            }
+            bar = bar.child(title);
+        }
+        bar.into_any_element()
+    }
+
+    fn render_menu_items(items: Vec<MenuItem>, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div()
+            .id("menu-items")
+            .absolute()
+            .top(px(24.))
+            .left_0()
+            .min_w(px(240.))
+            .py_1()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_md()
+            .occlude();
+        for (j, item) in items.into_iter().enumerate() {
+            match item {
+                MenuItem::Separator => list = list.child(div().my_1().h(px(1.)).bg(rgb(BORDER))),
+                MenuItem::Action { name, action, .. } => {
+                    list = list.child(
+                        div()
+                            .id(("menu-item", j))
+                            .px_3()
+                            .py_1()
+                            .whitespace_nowrap()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+                            .child(name)
+                            .on_click(cx.listener(move |t, _: &ClickEvent, window, cx| {
+                                t.open_menu = None;
+                                cx.notify();
+                                window.dispatch_action(action.boxed_clone(), cx);
+                            })),
+                    )
+                }
+                _ => {}
+            }
+        }
+        list.into_any_element()
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1467,22 +1578,53 @@ impl Render for DiffHarbor {
             .size_full()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .child(self.render_toolbar(cx))
-            .child(div().flex_1().min_h_0().child(body))
+            .when(IN_WINDOW_MENUBAR, |d| d.child(self.render_menubar(cx)))
             .child(
                 div()
+                    .relative()
                     .flex()
-                    .flex_row()
-                    .justify_between()
-                    .px_3()
-                    .py_1()
-                    .bg(rgb(PANEL))
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .text_size(px(12.))
-                    .text_color(rgb(DIM))
-                    .child(self.status.clone())
-                    .child(div().flex_none().text_color(rgb(TEXT)).child(counter)),
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_toolbar(cx))
+                    .child(div().flex_1().min_h_0().child(body))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(PANEL))
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .text_size(px(12.))
+                            .text_color(rgb(DIM))
+                            .child(self.status.clone())
+                            .child(div().flex_none().text_color(rgb(TEXT)).child(counter)),
+                    )
+                    // メニューを開いている間は、メニューの外のクリックでメニューを閉じる。
+                    .when(self.open_menu.is_some(), |d| {
+                        d.child(
+                            deferred(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|t, _: &MouseDownEvent, _, cx| {
+                                        t.open_menu = None;
+                                        cx.notify();
+                                    }))
+                                    .on_mouse_down(MouseButton::Right, cx.listener(|t, _: &MouseDownEvent, _, cx| {
+                                        t.open_menu = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .with_priority(1),
+                        )
+                    }),
             )
     }
 }
