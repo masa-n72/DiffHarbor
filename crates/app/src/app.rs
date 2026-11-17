@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,8 +19,8 @@ use gpui::{
 };
 
 use diff_core::{
-    compare_dirs, copy_entry, diff_lines, diff_lines_deadline, token_spans, DiffResult, Encoding, FolderEntry,
-    History, RowKind, Side, Status, EUC_JP, SHIFT_JIS, UTF_8,
+    compare_dirs_with, copy_entry, diff_lines, diff_lines_deadline, recompare, side_path, token_spans, DiffResult,
+    Encoding, FolderEntry, History, Progress, RowKind, Side, Status, EUC_JP, SHIFT_JIS, UTF_8,
 };
 
 use crate::{
@@ -157,11 +158,35 @@ struct FolderView {
 }
 
 impl FolderView {
-    fn new(left: PathBuf, right: PathBuf, only_diffs: bool) -> anyhow::Result<Self> {
-        let entries = compare_dirs(&left, &right)?;
+    fn new(left: PathBuf, right: PathBuf, entries: Vec<FolderEntry>, only_diffs: bool) -> Self {
         let mut v = Self { left, right, entries, visible: Vec::new(), selected: None, only_diffs };
         v.update_visible();
-        Ok(v)
+        v
+    }
+
+    /// 選択中の項目の、entries での番号。
+    fn selected_index(&self) -> Option<usize> {
+        self.selected.and_then(|s| self.visible.get(s).copied())
+    }
+
+    /// ステータスバーに出す件数。
+    fn summary(&self) -> String {
+        let files = self.entries.iter().filter(|e| !e.is_dir);
+        let (mut diff, mut lonly, mut ronly, mut err) = (0, 0, 0, 0);
+        for e in files {
+            match e.status {
+                Status::Different | Status::TypeMismatch => diff += 1,
+                Status::LeftOnly => lonly += 1,
+                Status::RightOnly => ronly += 1,
+                Status::Error => err += 1,
+                Status::Identical => {}
+            }
+        }
+        let mut s = format!("差異あり {diff} 件、左のみ {lonly} 件、右のみ {ronly} 件");
+        if err > 0 {
+            s.push_str(&format!("、エラー {err} 件"));
+        }
+        s
     }
 
     fn update_visible(&mut self) {
@@ -177,7 +202,7 @@ impl FolderView {
     }
 
     fn selected_entry(&self) -> Option<&FolderEntry> {
-        self.selected.and_then(|s| self.visible.get(s)).map(|&i| &self.entries[i])
+        self.selected_index().map(|i| &self.entries[i])
     }
 }
 
@@ -388,6 +413,8 @@ pub struct DiffHarbor {
     debug_actions: VecDeque<String>,
     /// アプリ内のメニューバーで開いているメニューの番号（Windows のみ使う）。
     open_menu: Option<usize>,
+    /// 実行中のフォルダ比較の進み具合。比較していなければ None。
+    folder_job: Option<Arc<Progress>>,
 }
 
 impl DiffHarbor {
@@ -409,6 +436,7 @@ impl DiffHarbor {
             allow_close: false,
             debug_actions: debug_actions(),
             open_menu: None,
+            folder_job: None,
         };
         // 閉じるボタンで閉じる時も、未保存の変更を確認する。
         let weak = cx.weak_entity();
@@ -522,9 +550,15 @@ impl DiffHarbor {
             cx.notify();
             return;
         };
-        let result: anyhow::Result<View> = if l.is_dir() && r.is_dir() {
-            FolderView::new(l, r, self.only_diffs).map(View::Folder)
-        } else if l.is_file() && r.is_file() {
+        if l.is_dir() && r.is_dir() {
+            self.start_folder_compare(l, r, None, None, cx);
+            return;
+        }
+        // フォルダ比較の途中なら中止する。
+        if let Some(job) = self.folder_job.take() {
+            job.cancel();
+        }
+        let result: anyhow::Result<View> = if l.is_file() && r.is_file() {
             FileView::new(&l, &r, None).map(View::File)
         } else {
             Err(anyhow::anyhow!("ファイル同士、またはフォルダ同士を選択してください"))
@@ -532,13 +566,8 @@ impl DiffHarbor {
         match result {
             Ok(view) => {
                 self.view = view;
-                match &self.view {
-                    View::File(_) => self.start_diff(cx),
-                    View::Folder(f) => {
-                        let n = f.entries.iter().filter(|e| !e.is_dir && e.status != Status::Identical).count();
-                        self.status = format!("{n} 件のファイルに差分があります").into();
-                    }
-                    View::Empty => {}
+                if let View::File(_) = &self.view {
+                    self.start_diff(cx);
                 }
             }
             Err(e) => self.status = e.to_string().into(),
@@ -590,6 +619,78 @@ impl DiffHarbor {
         self.run_debug_action(cx);
     }
 
+    /// フォルダの比較を別スレッドで始める。実行中の比較があれば中止する。
+    /// 終わったら一覧を表示する。`keep` は選択を残す一覧の行、`done` は終わった時に出す文言。
+    fn start_folder_compare(
+        &mut self,
+        left: PathBuf,
+        right: PathBuf,
+        keep: Option<usize>,
+        done: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(job) = self.folder_job.take() {
+            job.cancel();
+        }
+        let progress = Arc::new(Progress::default());
+        self.folder_job = Some(progress.clone());
+        self.status = "フォルダを比較中…".into();
+        cx.notify();
+
+        let task = {
+            let (l, r, p) = (left.clone(), right.clone(), progress.clone());
+            cx.background_executor().spawn(async move { compare_dirs_with(&l, &r, &p) })
+        };
+
+        // 0.2 秒ごとに調べた件数を出す。比較が終わるか、別の比較に替わったら止める。
+        let ticker = progress.clone();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            let running = this
+                .update(cx, |this, cx| match &this.folder_job {
+                    Some(job) if Arc::ptr_eq(job, &ticker) => {
+                        this.status = format!("フォルダを比較中… {} 件", job.scanned()).into();
+                        cx.notify();
+                        true
+                    }
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if !running {
+                break;
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                // 別の比較に替わっていたら、この結果は捨てる。
+                if !matches!(&this.folder_job, Some(job) if Arc::ptr_eq(job, &progress)) {
+                    return;
+                }
+                this.folder_job = None;
+                match result {
+                    Ok(entries) => {
+                        let mut f = FolderView::new(left, right, entries, this.only_diffs);
+                        f.selected = keep.filter(|&k| k < f.visible.len());
+                        let summary = f.summary();
+                        this.status = match done {
+                            Some(msg) => format!("{msg}（{summary}）"),
+                            None => summary,
+                        }
+                        .into();
+                        this.view = View::Folder(f);
+                    }
+                    Err(e) => this.status = e.to_string().into(),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     // ---- folder actions ----
 
     fn select_entry(&mut self, vis_ix: usize, cx: &mut Context<Self>) {
@@ -606,11 +707,15 @@ impl DiffHarbor {
         if entry.is_dir {
             return;
         }
+        if entry.status == Status::Error {
+            self.set_status(entry.error.unwrap_or_else(|| "読めません".into()), cx);
+            return;
+        }
         if !matches!(entry.status, Status::Identical | Status::Different) {
             self.set_status("両側に存在するファイルのみ比較できます", cx);
             return;
         }
-        let (l, r) = (f.left.join(&entry.rel), f.right.join(&entry.rel));
+        let (l, r) = (side_path(&f.entries, ei, Side::Left, &f.left), side_path(&f.entries, ei, Side::Right, &f.right));
         let View::Folder(mut folder) = std::mem::replace(&mut self.view, View::Empty) else { return };
         folder.selected = Some(vis_ix);
         match FileView::new(&l, &r, Some(Box::new(folder.clone()))) {
@@ -627,39 +732,40 @@ impl DiffHarbor {
 
     fn copy_selected(&mut self, to: Side, cx: &mut Context<Self>) {
         let View::Folder(f) = &self.view else { return };
-        let Some(entry) = f.selected_entry() else {
+        let Some(ix) = f.selected_index() else {
             self.set_status("コピーする項目を選択してください", cx);
             return;
         };
-        let (src, dst) = match to {
-            Side::Right => (&f.left, &f.right),
-            Side::Left => (&f.right, &f.left),
+        let from = match to {
+            Side::Right => Side::Left,
+            Side::Left => Side::Right,
         };
-        let exists_in_src = src.join(&entry.rel).symlink_metadata().is_ok();
-        if !exists_in_src {
+        if f.entries[ix].rel_on(from).is_none() {
             self.set_status("コピー元に存在しません", cx);
             return;
         }
-        let name = entry.rel.display().to_string();
-        match copy_entry(src, dst, &entry.rel) {
-            Ok(()) => {
-                self.refresh(cx);
-                self.set_status(format!("コピーしました: {name}"), cx);
-            }
+        let (from_root, to_root) = match to {
+            Side::Right => (&f.left, &f.right),
+            Side::Left => (&f.right, &f.left),
+        };
+        let src = side_path(&f.entries, ix, from, from_root);
+        let dst = side_path(&f.entries, ix, to, to_root);
+        let name = f.entries[ix].rel.display().to_string();
+        match copy_entry(&src, &dst) {
+            Ok(()) => self.refresh_with(Some(format!("コピーしました: {name}")), cx),
             Err(e) => self.set_status(e.to_string(), cx),
         }
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_with(None, cx);
+    }
+
+    /// 表示中のフォルダを比べ直す。比べ直す間も今の一覧を表示しておく。
+    fn refresh_with(&mut self, done: Option<String>, cx: &mut Context<Self>) {
         if let View::Folder(f) = &self.view {
-            match FolderView::new(f.left.clone(), f.right.clone(), f.only_diffs) {
-                Ok(mut nf) => {
-                    nf.selected = f.selected.filter(|&s| s < nf.visible.len());
-                    self.view = View::Folder(nf);
-                }
-                Err(e) => self.status = e.to_string().into(),
-            }
-            cx.notify();
+            let (l, r, keep) = (f.left.clone(), f.right.clone(), f.selected);
+            self.start_folder_compare(l, r, keep, done, cx);
         }
     }
 
@@ -875,9 +981,15 @@ impl DiffHarbor {
     /// フォルダ一覧へ戻る。未保存の確認は済んでいること。
     fn back_now(&mut self, cx: &mut Context<Self>) {
         if let View::File(f) = &mut self.view {
-            if let Some(folder) = f.back.take() {
+            if let Some(mut folder) = f.back.take() {
+                // 開いていたファイルだけを比べ直す。保存していれば状態が変わる。
+                if let Some(ix) = folder.selected_index() {
+                    recompare(&mut folder.entries, ix, &folder.left, &folder.right);
+                    folder.update_visible();
+                }
+                self.status = folder.summary().into();
                 self.view = View::Folder(*folder);
-                self.refresh(cx);
+                cx.notify();
             }
         }
     }
@@ -1466,6 +1578,7 @@ impl DiffHarbor {
                     Status::LeftOnly => ("左のみ", STATUS_LEFT_ONLY),
                     Status::RightOnly => ("右のみ", STATUS_RIGHT_ONLY),
                     Status::TypeMismatch => ("種類が異なる", STATUS_MISMATCH),
+                    Status::Error => ("エラー", STATUS_ERROR),
                 };
                 let name = format!("{}{}", if entry.is_dir { "▾ " } else { "   " }, entry.name);
                 Some(

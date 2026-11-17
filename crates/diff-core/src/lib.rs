@@ -11,7 +11,9 @@ pub mod merge;
 pub mod text;
 
 pub use diff::{apply_hunk, diff_lines, diff_lines_deadline, token_spans, DiffResult, Hunk, Row, RowKind};
-pub use folder::{compare_dirs, copy_entry, FolderEntry, Status};
+pub use folder::{
+    compare_dirs, compare_dirs_with, copy_entry, recompare, side_path, FolderEntry, Meta, Progress, Status, CANCELLED,
+};
 pub use merge::{History, Side};
 pub use encoding_rs::{Encoding, EUC_JP, SHIFT_JIS, UTF_8};
 pub use text::{decode, load, save, Eol, TextFile};

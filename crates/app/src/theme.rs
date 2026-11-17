@@ -42,6 +42,7 @@ pub const STATUS_DIFFERENT: u32 = 0xA06A00;
 pub const STATUS_LEFT_ONLY: u32 = 0xC62828;
 pub const STATUS_RIGHT_ONLY: u32 = 0x1565C0;
 pub const STATUS_MISMATCH: u32 = 0x7B1FA2;
+pub const STATUS_ERROR: u32 = 0xB71C1C;
 
 /// 本文に使う等幅フォント。日本語は macOS のフォールバックで表示される。
 #[cfg(target_os = "macos")]
