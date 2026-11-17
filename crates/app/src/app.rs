@@ -1,4 +1,8 @@
-//! The DiffHarbor main view: toolbar, folder comparison and side-by-side file diff.
+//! DiffHarbor の画面。
+//!
+//! - [`DiffHarbor`]: ウィンドウ。メニューバー（Windows）、ウィンドウを閉じる時と終了時の未保存の確認。
+//!   比較（[`CompareView`]）を持つ。今は 1 つだけだが、タブで複数持てる形にしてある
+//! - [`CompareView`]: 比較 1 件ぶん。ツールバー、フォルダ一覧、ファイル比較、ステータスバー
 
 use std::{
     cell::Cell,
@@ -12,7 +16,7 @@ use std::{
 
 use gpui::{
     actions, canvas, deferred, div, fill, font, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
-    AnyElement, App, BorderStyle, Bounds, ClickEvent, Context, Corners, Edges, FocusHandle,
+    AnyElement, App, BorderStyle, Entity, Bounds, ClickEvent, Context, Corners, Edges, FocusHandle,
     HighlightStyle, Hsla, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
     PathPromptOptions, PromptLevel, Render, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
     StyledText, UniformListScrollHandle, Window,
@@ -299,10 +303,8 @@ impl FolderView {
     }
 }
 
-/// 未保存の変更を確認した後に実行する操作。
+/// 比較の中で、未保存の変更を確認した後に実行する操作。
 enum Pending {
-    CloseWindow,
-    Quit,
     /// `side` に別のファイルやフォルダを開く。
     Open(Side, PathBuf),
     Back,
@@ -495,7 +497,8 @@ enum View {
     File(FileView),
 }
 
-pub struct DiffHarbor {
+/// 比較 1 件ぶんの画面と状態。
+pub struct CompareView {
     focus: FocusHandle,
     left_path: Option<PathBuf>,
     right_path: Option<PathBuf>,
@@ -510,17 +513,13 @@ pub struct DiffHarbor {
     char_w: Option<f32>,
     /// 位置ペインのバーの (上端の y 座標, 高さ)。描画時に記録し、クリック位置の計算に使う。
     loc_geom: Rc<Cell<Option<(f32, f32)>>>,
-    /// 未保存の確認を済ませて、ウィンドウを閉じてよい状態か。
-    allow_close: bool,
     /// 開発時の確認用。差分の計算が終わるたびに 1 つずつ実行する操作。
     debug_actions: VecDeque<String>,
-    /// アプリ内のメニューバーで開いているメニューの番号（Windows のみ使う）。
-    open_menu: Option<usize>,
     /// 実行中のフォルダ比較の進み具合。比較していなければ None。
     folder_job: Option<Arc<Progress>>,
 }
 
-impl DiffHarbor {
+impl CompareView {
     pub fn new(args: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus);
@@ -536,24 +535,9 @@ impl DiffHarbor {
             title: String::new(),
             char_w: None,
             loc_geom: Rc::new(Cell::new(None)),
-            allow_close: false,
             debug_actions: debug_actions(),
-            open_menu: None,
             folder_job: None,
         };
-        // 閉じるボタンで閉じる時も、未保存の変更を確認する。
-        let weak = cx.weak_entity();
-        window.on_window_should_close(cx, move |window, cx| {
-            weak.update(cx, |this, cx| {
-                if this.allow_close || !this.has_unsaved() {
-                    true
-                } else {
-                    this.guard(Pending::CloseWindow, window, cx);
-                    false
-                }
-            })
-            .unwrap_or(true)
-        });
         if let [l, r, ..] = args.as_slice() {
             this.left_path = Some(l.clone());
             this.right_path = Some(r.clone());
@@ -567,7 +551,7 @@ impl DiffHarbor {
         cx.notify();
     }
 
-    fn has_unsaved(&self) -> bool {
+    pub fn has_unsaved(&self) -> bool {
         matches!(&self.view, View::File(f) if f.has_unsaved())
     }
 
@@ -605,12 +589,8 @@ impl DiffHarbor {
     }
 
     fn run(&mut self, pending: Pending, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
         match pending {
-            Pending::CloseWindow => {
-                self.allow_close = true;
-                window.remove_window();
-            }
-            Pending::Quit => cx.quit(),
             Pending::Open(side, path) => {
                 match side {
                     Side::Left => self.left_path = Some(path),
@@ -796,12 +776,8 @@ impl DiffHarbor {
         .detach();
     }
 
-    /// 実行中のフォルダ比較を中止する。開いているメニューがあれば、先にメニューを閉じる。
-    fn cancel_compare(&mut self, cx: &mut Context<Self>) {
-        if self.open_menu.take().is_some() {
-            cx.notify();
-            return;
-        }
+    /// 実行中のフォルダ比較を中止する。
+    fn cancel_compare(&mut self, _cx: &mut Context<Self>) {
         if let Some(job) = &self.folder_job {
             job.cancel();
         }
@@ -1129,7 +1105,7 @@ impl DiffHarbor {
     }
 
     /// 未保存の側をすべて保存する。保存したファイル名を返す。
-    fn save_all(&mut self) -> Result<Vec<String>, String> {
+    pub fn save_all(&mut self) -> Result<Vec<String>, String> {
         let View::File(f) = &mut self.view else { return Ok(Vec::new()) };
         let mut saved = Vec::new();
         for side in [Side::Left, Side::Right] {
@@ -1251,90 +1227,6 @@ impl DiffHarbor {
             .text_size(px(12.))
             .when(enabled, |b| b.cursor_pointer().hover(|s| s.bg(rgb(BUTTON_HOVER))))
             .child(label.to_string())
-    }
-
-    /// アプリ内のメニューバー（Windows 用）。項目を選ぶと、メニューと同じ操作を実行する。
-    fn render_menubar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut bar = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_1()
-            .bg(rgb(PANEL))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .text_size(px(12.))
-            .text_color(rgb(TEXT));
-        for (i, menu) in app_menus().into_iter().enumerate() {
-            let open = self.open_menu == Some(i);
-            let mut title = div()
-                .id(("menu", i))
-                .relative()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .when(open, |d| d.bg(rgb(BUTTON_HOVER)))
-                .hover(|s| s.bg(rgb(BUTTON_HOVER)))
-                .child(menu.name.clone())
-                .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| {
-                    t.open_menu = if t.open_menu == Some(i) { None } else { Some(i) };
-                    cx.notify();
-                }))
-                // メニューを開いている間は、ポインタを載せたメニューに切り替える。
-                .on_hover(cx.listener(move |t, hovered: &bool, _, cx| {
-                    if *hovered && t.open_menu.is_some() && t.open_menu != Some(i) {
-                        t.open_menu = Some(i);
-                        cx.notify();
-                    }
-                }));
-            if open {
-                title = title.child(deferred(Self::render_menu_items(menu.items, cx)).with_priority(2));
-            }
-            bar = bar.child(title);
-        }
-        bar.into_any_element()
-    }
-
-    fn render_menu_items(items: Vec<MenuItem>, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = div()
-            .id("menu-items")
-            .absolute()
-            .top(px(24.))
-            .left_0()
-            .min_w(px(240.))
-            .py_1()
-            .flex()
-            .flex_col()
-            .bg(rgb(BG))
-            .border_1()
-            .border_color(rgb(BORDER))
-            .shadow_md()
-            .occlude();
-        for (j, item) in items.into_iter().enumerate() {
-            match item {
-                MenuItem::Separator => list = list.child(div().my_1().h(px(1.)).bg(rgb(BORDER))),
-                MenuItem::Action { name, action, .. } => {
-                    list = list.child(
-                        div()
-                            .id(("menu-item", j))
-                            .px_3()
-                            .py_1()
-                            .whitespace_nowrap()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BUTTON_HOVER)))
-                            .child(name)
-                            .on_click(cx.listener(move |t, _: &ClickEvent, window, cx| {
-                                t.open_menu = None;
-                                cx.notify();
-                                window.dispatch_action(action.boxed_clone(), cx);
-                            })),
-                    )
-                }
-                _ => {}
-            }
-        }
-        list.into_any_element()
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1941,7 +1833,7 @@ impl DiffHarbor {
     }
 }
 
-impl Render for DiffHarbor {
+impl Render for CompareView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match (&self.left_path, &self.right_path) {
             (Some(l), Some(r)) => format!(
@@ -1980,11 +1872,10 @@ impl Render for DiffHarbor {
         };
 
         div()
-            .key_context(if matches!(self.view, View::Folder(_)) { "DiffHarbor FolderView" } else { "DiffHarbor" })
+            .key_context(if matches!(self.view, View::Folder(_)) { "Compare FolderView" } else { "Compare" })
             .track_focus(&self.focus)
             .on_action(cx.listener(|t, _: &OpenLeft, window, cx| t.pick(Side::Left, window, cx)))
             .on_action(cx.listener(|t, _: &OpenRight, window, cx| t.pick(Side::Right, window, cx)))
-            .on_action(cx.listener(|t, _: &Quit, window, cx| t.guard(Pending::Quit, window, cx)))
             .on_action(cx.listener(|t, _: &CopyAllToRight, _, cx| t.copy_all(Side::Right, cx)))
             .on_action(cx.listener(|t, _: &CopyAllToLeft, _, cx| t.copy_all(Side::Left, cx)))
             .on_action(cx.listener(|t, _: &Redo, _, cx| t.redo(cx)))
@@ -2034,7 +1925,229 @@ impl Render for DiffHarbor {
             .on_action(cx.listener(|t, _: &Undo, _, cx| t.undo(cx)))
             .on_action(cx.listener(|t, _: &Refresh, _, cx| t.refresh(cx)))
             .on_action(cx.listener(|t, _: &Back, window, cx| t.guard(Pending::Back, window, cx)))
-            .on_action(cx.listener(|t, _: &CloseWindow, window, cx| t.guard(Pending::CloseWindow, window, cx)))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .child(self.render_toolbar(cx))
+            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(PANEL))
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(12.))
+                    .text_color(rgb(DIM))
+                    .child(self.status.clone())
+                    .child(div().flex_none().text_color(rgb(TEXT)).child(counter)),
+            )
+    }
+}
+
+// ---- ウィンドウ ----
+
+/// ウィンドウを閉じる時と終了時に、未保存の変更を確認した後に実行する操作。
+enum WindowPending {
+    CloseWindow,
+    Quit,
+}
+
+/// ウィンドウ。比較を持ち、メニューバー（Windows）と、ウィンドウを閉じる時の確認を受け持つ。
+pub struct DiffHarbor {
+    /// 比較の一覧。今は常に 1 つ。タブを付ける時に複数にする。
+    tabs: Vec<Entity<CompareView>>,
+    /// 表示中の比較の番号。
+    active: usize,
+    /// アプリ内のメニューバーで開いているメニューの番号（Windows のみ使う）。
+    open_menu: Option<usize>,
+    /// 未保存の確認を済ませて、ウィンドウを閉じてよい状態か。
+    allow_close: bool,
+}
+
+impl DiffHarbor {
+    pub fn new(args: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let tab = cx.new(|cx| CompareView::new(args, window, cx));
+        // 閉じるボタンで閉じる時も、未保存の変更を確認する。
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |this, cx| {
+                if this.allow_close || !this.has_unsaved(cx) {
+                    true
+                } else {
+                    this.guard_window(WindowPending::CloseWindow, window, cx);
+                    false
+                }
+            })
+            .unwrap_or(true)
+        });
+        Self { tabs: vec![tab], active: 0, open_menu: None, allow_close: false }
+    }
+
+    /// どれかの比較に未保存の変更があるか。
+    fn has_unsaved(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|t| t.read(cx).has_unsaved())
+    }
+
+    /// 未保存の変更があれば確認してから、ウィンドウを閉じる、または終了する。
+    /// 「保存」を選んだ時は全部の比較を保存する。保存に失敗した比較があれば中止する（理由はその比較に出る）。
+    fn guard_window(&mut self, pending: WindowPending, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_unsaved(cx) {
+            self.run_window(pending, window, cx);
+            return;
+        }
+        let rx = window.prompt(
+            PromptLevel::Warning,
+            "変更が保存されていません",
+            Some("保存しない場合、マージした内容は失われます。"),
+            &["保存", "保存しない", "キャンセル"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = rx.await else { return };
+            this.update_in(cx, |this, window, cx| match answer {
+                0 => {
+                    let tabs = this.tabs.clone();
+                    let saved = tabs.iter().all(|tab| {
+                        tab.update(cx, |t, cx| match t.save_all() {
+                            Ok(_) => true,
+                            Err(e) => {
+                                t.set_status(e, cx);
+                                false
+                            }
+                        })
+                    });
+                    if saved {
+                        this.run_window(pending, window, cx);
+                    }
+                }
+                1 => this.run_window(pending, window, cx),
+                _ => {}
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_window(&mut self, pending: WindowPending, window: &mut Window, cx: &mut Context<Self>) {
+        match pending {
+            WindowPending::CloseWindow => {
+                self.allow_close = true;
+                window.remove_window();
+            }
+            WindowPending::Quit => cx.quit(),
+        }
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        cx.notify();
+    }
+
+    /// アプリ内のメニューバー（Windows 用）。項目を選ぶと、メニューと同じ操作を実行する。
+    fn render_menubar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_1()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(12.))
+            .text_color(rgb(TEXT));
+        for (i, menu) in app_menus().into_iter().enumerate() {
+            let open = self.open_menu == Some(i);
+            let mut title = div()
+                .id(("menu", i))
+                .relative()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(open, |d| d.bg(rgb(BUTTON_HOVER)))
+                .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+                .child(menu.name.clone())
+                .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| {
+                    t.open_menu = if t.open_menu == Some(i) { None } else { Some(i) };
+                    cx.notify();
+                }))
+                // メニューを開いている間は、ポインタを載せたメニューに切り替える。
+                .on_hover(cx.listener(move |t, hovered: &bool, _, cx| {
+                    if *hovered && t.open_menu.is_some() && t.open_menu != Some(i) {
+                        t.open_menu = Some(i);
+                        cx.notify();
+                    }
+                }));
+            if open {
+                title = title.child(deferred(Self::render_menu_items(menu.items, cx)).with_priority(2));
+            }
+            bar = bar.child(title);
+        }
+        bar.into_any_element()
+    }
+
+    fn render_menu_items(items: Vec<MenuItem>, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div()
+            .id("menu-items")
+            .absolute()
+            .top(px(24.))
+            .left_0()
+            .min_w(px(240.))
+            .py_1()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_md()
+            .occlude();
+        for (j, item) in items.into_iter().enumerate() {
+            match item {
+                MenuItem::Separator => list = list.child(div().my_1().h(px(1.)).bg(rgb(BORDER))),
+                MenuItem::Action { name, action, .. } => {
+                    list = list.child(
+                        div()
+                            .id(("menu-item", j))
+                            .px_3()
+                            .py_1()
+                            .whitespace_nowrap()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+                            .child(name)
+                            .on_click(cx.listener(move |t, _: &ClickEvent, window, cx| {
+                                t.open_menu = None;
+                                cx.notify();
+                                window.dispatch_action(action.boxed_clone(), cx);
+                            })),
+                    )
+                }
+                _ => {}
+            }
+        }
+        list.into_any_element()
+    }
+}
+
+impl Render for DiffHarbor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.tabs[self.active].clone();
+        div()
+            .key_context("DiffHarbor")
+            // Esc でメニューを閉じる。メニューを開いていなければ、比較の側（比較の中止）へ渡す。
+            .capture_action(cx.listener(|t, _: &CancelCompare, _, cx| {
+                if t.open_menu.is_some() {
+                    t.close_menu(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|t, _: &Quit, window, cx| t.guard_window(WindowPending::Quit, window, cx)))
+            .on_action(cx.listener(|t, _: &CloseWindow, window, cx| t.guard_window(WindowPending::CloseWindow, window, cx)))
             .flex()
             .flex_col()
             .size_full()
@@ -2048,23 +2161,7 @@ impl Render for DiffHarbor {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_toolbar(cx))
-                    .child(div().flex_1().min_h_0().child(body))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .justify_between()
-                            .px_3()
-                            .py_1()
-                            .bg(rgb(PANEL))
-                            .border_t_1()
-                            .border_color(rgb(BORDER))
-                            .text_size(px(12.))
-                            .text_color(rgb(DIM))
-                            .child(self.status.clone())
-                            .child(div().flex_none().text_color(rgb(TEXT)).child(counter)),
-                    )
+                    .child(active)
                     // メニューを開いている間は、メニューの外のクリックでメニューを閉じる。
                     .when(self.open_menu.is_some(), |d| {
                         d.child(
@@ -2075,14 +2172,8 @@ impl Render for DiffHarbor {
                                     .left_0()
                                     .size_full()
                                     .occlude()
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|t, _: &MouseDownEvent, _, cx| {
-                                        t.open_menu = None;
-                                        cx.notify();
-                                    }))
-                                    .on_mouse_down(MouseButton::Right, cx.listener(|t, _: &MouseDownEvent, _, cx| {
-                                        t.open_menu = None;
-                                        cx.notify();
-                                    })),
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|t, _: &MouseDownEvent, _, cx| t.close_menu(cx)))
+                                    .on_mouse_down(MouseButton::Right, cx.listener(|t, _: &MouseDownEvent, _, cx| t.close_menu(cx))),
                             )
                             .with_priority(1),
                         )
