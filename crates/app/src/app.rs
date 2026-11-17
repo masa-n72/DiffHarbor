@@ -23,9 +23,9 @@ use gpui::{
 };
 
 use diff_core::{
-    ancestors, compare_dirs_with, copy_entry, diff_lines, diff_lines_deadline, next_diff, recompare, side_path,
-    token_spans, tree_order, visible_rows, DiffResult, Encoding, FolderEntry, History, Progress, RowKind, ShowFilter,
-    Side, SortKey, Status, EUC_JP, SHIFT_JIS, UTF_8,
+    ancestors, compare_dirs_with, compare_ini, copy_edits, copy_entry, diff_lines, diff_lines_deadline, is_ini_path,
+    next_diff, recompare, side_path, token_spans, tree_order, visible_rows, DiffResult, Encoding, FolderEntry, History,
+    IniDiff, IniStatus, Progress, RowKind, ShowFilter, Side, SortKey, Status, EUC_JP, SHIFT_JIS, UTF_8,
 };
 
 use crate::{
@@ -73,6 +73,8 @@ actions!(
         ExpandAll,
         CollapseAll,
         CancelCompare,
+        ToggleIniMode,
+        ToggleIniOnlyDiffs,
     ]
 );
 
@@ -125,6 +127,8 @@ const FONT_SIZE: f32 = 12.0;
 const GUTTER_W: f32 = 48.0;
 /// 中央の操作列の幅。
 const MID_W: f32 = 44.0;
+/// キー単位の表示の、セクション / キーの列の幅。
+const INI_KEY_W: f32 = 240.0;
 /// フォルダ一覧の列の幅。
 const STATUS_COL_W: f32 = 110.0;
 const TIME_COL_W: f32 = 140.0;
@@ -331,10 +335,22 @@ struct FileView {
     max_line_px: Option<f32>,
     /// 変更行ごとの行内差分。キーは表示行の番号。
     span_cache: HashMap<usize, Spans>,
+    /// キー単位（INI）で表示しているか。
+    ini_mode: bool,
+    /// キー単位の比較結果。内容が変わるたびに作り直す。
+    ini: Rc<IniDiff>,
+    /// キー単位の表示で出す行（ini.rows の番号）。
+    ini_visible: Vec<usize>,
+    /// キー単位の表示で選択中の行（ini.rows の番号）。
+    ini_current: Option<usize>,
+    /// キー単位の表示で、差異のある行だけを出すか。
+    ini_only_diffs: bool,
 }
 
 impl FileView {
     fn new(left: &Path, right: &Path, back: Option<Box<FolderView>>) -> anyhow::Result<Self> {
+        // 左右どちらかの拡張子が .ini なら、キー単位で開く。
+        let ini_mode = is_ini_path(left) || is_ini_path(right);
         let (left, right) = (Document::load(left, None)?, Document::load(right, None)?);
         Ok(Self {
             left,
@@ -348,7 +364,43 @@ impl FileView {
             h_scroll: debug_initial_h_scroll(),
             max_line_px: None,
             span_cache: HashMap::new(),
+            ini_mode,
+            ini: Rc::new(IniDiff::default()),
+            ini_visible: Vec::new(),
+            ini_current: None,
+            ini_only_diffs: false,
         })
+    }
+
+    /// キー単位の比較を作り直す。選択は、同じ番号以降の最初の差異へ移す。
+    fn refresh_ini(&mut self) {
+        self.ini = Rc::new(compare_ini(&self.left.file.lines, &self.right.file.lines));
+        self.update_ini_visible();
+        let diffs = self.ini_diff_rows();
+        self.ini_current = match self.ini_current {
+            Some(c) => diffs.iter().copied().find(|&d| d >= c).or_else(|| diffs.last().copied()),
+            None => diffs.first().copied(),
+        };
+    }
+
+    fn update_ini_visible(&mut self) {
+        let only = self.ini_only_diffs;
+        self.ini_visible =
+            (0..self.ini.rows.len()).filter(|&i| !only || self.ini.rows[i].status != IniStatus::Same).collect();
+    }
+
+    /// キー単位の表示で、差異のある行（表示している行のうち）。
+    fn ini_diff_rows(&self) -> Vec<usize> {
+        self.ini_visible.iter().copied().filter(|&i| self.ini.rows[i].status != IniStatus::Same).collect()
+    }
+
+    /// 差異があるか。表示の方式に合わせて答える。
+    fn has_diffs(&self) -> bool {
+        if self.ini_mode {
+            self.ini.rows.iter().any(|r| r.status != IniStatus::Same)
+        } else {
+            !self.diff.hunks.is_empty()
+        }
     }
 
     fn set_diff(&mut self, diff: DiffResult) {
@@ -453,6 +505,9 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("元に戻す", Undo),
             MenuItem::action("やり直す", Redo),
+            MenuItem::separator(),
+            MenuItem::action("行単位 / キー単位で比較", ToggleIniMode),
+            MenuItem::action("キー単位: 差異のみ表示", ToggleIniOnlyDiffs),
         ],
     });
     menus.push(Menu {
@@ -505,6 +560,8 @@ pub struct CompareView {
     view: View,
     status: SharedString,
     diff_scroll: UniformListScrollHandle,
+    /// キー単位の表示のスクロール。
+    ini_scroll: UniformListScrollHandle,
     folder_scroll: UniformListScrollHandle,
     /// フォルダ一覧の表示の設定。
     folder_prefs: FolderPrefs,
@@ -530,6 +587,7 @@ impl CompareView {
             view: View::Empty,
             status: OPEN_HINT.into(),
             diff_scroll: UniformListScrollHandle::new(),
+            ini_scroll: UniformListScrollHandle::new(),
             folder_scroll: UniformListScrollHandle::new(),
             folder_prefs: FolderPrefs::default(),
             title: String::new(),
@@ -662,6 +720,8 @@ impl CompareView {
     fn start_diff(&mut self, cx: &mut Context<Self>) {
         let View::File(f) = &mut self.view else { return };
         f.generation += 1;
+        // キー単位の比較は軽いので、その場で作り直す。
+        f.refresh_ini();
         if f.left.lines.len() + f.right.lines.len() <= SYNC_DIFF_LINES {
             let diff = diff_lines(&f.left.lines, &f.right.lines);
             f.set_diff(diff);
@@ -694,8 +754,17 @@ impl CompareView {
 
     fn after_diff(&mut self, cx: &mut Context<Self>) {
         if let View::File(f) = &self.view {
-            let n = f.diff.hunks.len();
-            self.status = if n == 0 { "差分はありません".into() } else { format!("{n} 件の差分").into() };
+            self.status = if f.ini_mode {
+                let n = f.ini.rows.iter().filter(|r| r.key.is_some() && r.status != IniStatus::Same).count();
+                let s = f.ini.rows.iter().filter(|r| r.key.is_none() && matches!(r.status, IniStatus::LeftOnly | IniStatus::RightOnly)).count();
+                match (n, s) {
+                    (0, 0) => "キー単位: 差異はありません".into(),
+                    _ => format!("キー単位: 差異のあるキー {n} 件、片側だけのセクション {s} 件").into(),
+                }
+            } else {
+                let n = f.diff.hunks.len();
+                if n == 0 { "差分はありません".into() } else { format!("{n} 件の差分").into() }
+            };
         }
         self.scroll_to_current();
         cx.notify();
@@ -980,6 +1049,12 @@ impl CompareView {
 
     fn scroll_to_current(&self) {
         if let View::File(f) = &self.view {
+            if f.ini_mode {
+                if let Some(pos) = f.ini_current.and_then(|c| f.ini_visible.iter().position(|&v| v == c)) {
+                    self.ini_scroll.scroll_to_item(pos, ScrollStrategy::Center);
+                }
+                return;
+            }
             if let Some(h) = f.current.and_then(|c| f.diff.hunks.get(c)) {
                 self.diff_scroll.scroll_to_item(h.first_row, ScrollStrategy::Center);
             }
@@ -996,6 +1071,9 @@ impl CompareView {
     }
 
     fn step_hunk(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if matches!(&self.view, View::File(f) if f.ini_mode) {
+            return self.step_ini(delta, None, cx);
+        }
         let View::File(f) = &mut self.view else { return };
         let n = f.diff.hunks.len();
         if n == 0 || f.computing {
@@ -1018,6 +1096,9 @@ impl CompareView {
 
     /// 先頭（`last` が false）または末尾の差分へ移動する。
     fn goto_edge_hunk(&mut self, last: bool, cx: &mut Context<Self>) {
+        if matches!(&self.view, View::File(f) if f.ini_mode) {
+            return self.step_ini(0, Some(last), cx);
+        }
         let View::File(f) = &mut self.view else { return };
         let n = f.diff.hunks.len();
         if n == 0 || f.computing {
@@ -1056,6 +1137,11 @@ impl CompareView {
 
     fn copy_current(&mut self, to: Side, cx: &mut Context<Self>) {
         match &self.view {
+            View::File(f) if f.ini_mode => {
+                if let Some(c) = f.ini_current {
+                    self.copy_ini_rows(vec![c], to, cx);
+                }
+            }
             View::File(f) => {
                 if let Some(c) = f.current {
                     self.copy_hunk(c, to, cx);
@@ -1068,6 +1154,12 @@ impl CompareView {
 
     /// すべての差分を `to` の側へコピーする。1 回の操作として元に戻せる。
     fn copy_all(&mut self, to: Side, cx: &mut Context<Self>) {
+        if let View::File(f) = &self.view {
+            if f.ini_mode {
+                let rows = f.ini.diff_rows();
+                return self.copy_ini_rows(rows, to, cx);
+            }
+        }
         let View::File(f) = &mut self.view else { return };
         if f.computing || f.diff.hunks.is_empty() {
             return;
@@ -1076,6 +1168,76 @@ impl CompareView {
         f.history.copy_hunks(&mut f.left.file.lines, &mut f.right.file.lines, &diff.hunks, to);
         f.sync_dirty();
         self.start_diff(cx);
+    }
+
+    // ---- キー単位（INI）の操作 ----
+
+    /// キー単位の表示で、`rows`（ini.rows の番号）を `to` の側へコピーする。1 回の操作として元に戻せる。
+    fn copy_ini_rows(&mut self, rows: Vec<usize>, to: Side, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        if rows.is_empty() {
+            return;
+        }
+        let edits = copy_edits(&f.left.file.lines, &f.right.file.lines, &rows, to);
+        if !f.history.apply_edits(&mut f.left.file.lines, &mut f.right.file.lines, edits, to) {
+            self.set_status("コピーする内容がありません", cx);
+            return;
+        }
+        f.sync_dirty();
+        self.start_diff(cx);
+    }
+
+    /// キー単位の表示で、次 / 前（`delta`）、または先頭 / 末尾（`edge`）の差異へ移る。
+    fn step_ini(&mut self, delta: isize, edge: Option<bool>, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        let diffs = f.ini_diff_rows();
+        if diffs.is_empty() {
+            return;
+        }
+        let pos = f.ini_current.and_then(|c| diffs.iter().position(|&d| d == c));
+        let next = match (edge, pos) {
+            (Some(true), _) => diffs.len() - 1,
+            (Some(false), _) => 0,
+            (None, None) => {
+                // 選択が差異の行でなければ、選択より後（前）の最初の差異。
+                let c = f.ini_current.unwrap_or(0);
+                if delta > 0 {
+                    diffs.iter().position(|&d| d > c).unwrap_or(diffs.len() - 1)
+                } else {
+                    diffs.iter().rposition(|&d| d < c).unwrap_or(0)
+                }
+            }
+            (None, Some(p)) => (p as isize + delta).clamp(0, diffs.len() as isize - 1) as usize,
+        };
+        if edge.is_none() && pos == Some(next) {
+            self.status = if delta > 0 { "最後の差異です".into() } else { "最初の差異です".into() };
+        } else {
+            f.ini_current = Some(diffs[next]);
+        }
+        self.scroll_to_current();
+        cx.notify();
+    }
+
+    fn select_ini_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let View::File(f) = &mut self.view {
+            f.ini_current = Some(row);
+            cx.notify();
+        }
+    }
+
+    /// 行単位とキー単位の表示を切り替える。
+    fn toggle_ini_mode(&mut self, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        f.ini_mode = !f.ini_mode;
+        self.after_diff(cx);
+    }
+
+    fn toggle_ini_only_diffs(&mut self, cx: &mut Context<Self>) {
+        let View::File(f) = &mut self.view else { return };
+        f.ini_only_diffs = !f.ini_only_diffs;
+        f.update_ini_visible();
+        self.scroll_to_current();
+        cx.notify();
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
@@ -1233,7 +1395,9 @@ impl CompareView {
         let in_file = matches!(self.view, View::File(_));
         let in_folder = matches!(self.view, View::Folder(_));
         let has_back = matches!(&self.view, View::File(f) if f.back.is_some());
-        let has_hunks = matches!(&self.view, View::File(f) if !f.diff.hunks.is_empty());
+        let has_hunks = matches!(&self.view, View::File(f) if f.has_diffs());
+        let ini_mode = matches!(&self.view, View::File(f) if f.ini_mode);
+        let ini_only = matches!(&self.view, View::File(f) if f.ini_only_diffs);
         let can_copy = has_hunks || matches!(&self.view, View::Folder(f) if f.selected.is_some());
         let can_undo = matches!(&self.view, View::File(f) if f.history.can_undo());
         let can_redo = matches!(&self.view, View::File(f) if f.history.can_redo());
@@ -1268,6 +1432,14 @@ impl CompareView {
                         d.child(Self::button("copy-all-r", "すべて右へ", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_all(Side::Right, cx)))))
                             .child(Self::button("copy-all-l", "すべて左へ", has_hunks).when(has_hunks, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.copy_all(Side::Left, cx)))))
                     })
+            })
+            .when(in_file, |d| {
+                d.child(div().w(px(1.)).h(px(18.)).bg(rgb(BORDER)))
+                    .child(Self::button("ini-mode", if ini_mode { "✓ キー単位" } else { "キー単位" }, true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.toggle_ini_mode(cx))))
+                    .when(ini_mode, |d| {
+                        d.child(Self::button("ini-only", if ini_only { "✓ 差異のみ" } else { "差異のみ" }, true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.toggle_ini_only_diffs(cx))))
+                    })
+                    .child(div().w(px(1.)).h(px(18.)).bg(rgb(BORDER)))
             })
             .when(in_file, |d| {
                 d.child(Self::button("undo", "元に戻す", can_undo).when(can_undo, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.undo(cx)))))
@@ -1340,6 +1512,9 @@ impl CompareView {
     }
 
     fn render_file(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(&self.view, View::File(f) if f.ini_mode) {
+            return self.render_ini(cx);
+        }
         // 半角 1 文字の幅を一度だけ測る。横スクロールの範囲の計算に使う。
         let char_w = *self.char_w.get_or_insert_with(|| {
             let ts = window.text_system();
@@ -1466,6 +1641,171 @@ impl CompareView {
             .child(self.render_location(cx))
             .child(panes)
             .into_any_element()
+    }
+
+    /// キー単位（INI）の表示。セクションとキーの表に、左右の値を並べる。
+    fn render_ini(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let View::File(f) = &self.view else { return div().into_any_element() };
+        let mark = |d: &Document| if d.dirty { "● " } else { "" };
+        let header = Self::path_header(
+            format!("{}{}", mark(&f.left), f.left.path.display()),
+            format!("{}{}", mark(&f.right), f.right.path.display()),
+        );
+        let head_cell = |label: &str| div().flex_1().min_w_0().px_2().py_1().border_r_1().border_color(rgb(BORDER)).child(label.to_string());
+        let columns = div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(12.))
+            .text_color(rgb(TEXT))
+            .child(div().w(px(INI_KEY_W)).flex_none().px_2().py_1().border_r_1().border_color(rgb(BORDER)).child("セクション / キー"))
+            .child(head_cell("左の値"))
+            .child(head_cell("右の値"));
+        let body = if f.ini.rows.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(DIM))
+                .child("セクションもキーもありません")
+                .into_any_element()
+        } else {
+            uniform_list(
+                "ini-rows",
+                f.ini_visible.len(),
+                cx.processor(|this, range: Range<usize>, _w, cx| this.render_ini_rows(range, cx)),
+            )
+            .track_scroll(self.ini_scroll.clone())
+            .flex_1()
+            .w_full()
+            .into_any_element()
+        };
+        let pane_status = |d: &Document| {
+            let mut text = format!("{}　　{}　　{} 行", d.encoding_label(), d.eol_label(), d.lines.len());
+            if d.lossy {
+                text.push_str("　　変換できない文字があります（保存できません）");
+            }
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .px_2()
+                .py_1()
+                .text_size(px(12.))
+                .text_color(rgb(if d.lossy { STATUS_LEFT_ONLY } else { TEXT }))
+                .child(text)
+        };
+        let status = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .bg(rgb(PANEL))
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(div().w(px(INI_KEY_W)).flex_none())
+            .child(pane_status(&f.left))
+            .child(pane_status(&f.right));
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(columns)
+            .child(body)
+            .child(status)
+            .into_any_element()
+    }
+
+    fn render_ini_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let View::File(f) = &self.view else { return Vec::new() };
+        range
+            .filter_map(|ix| {
+                let ri = *f.ini_visible.get(ix)?;
+                let row = f.ini.rows.get(ri)?;
+                let selected = f.ini_current == Some(ri);
+                let section = row.is_section();
+                // 値の欄の背景。片側にない側は灰色、差異のある側は黄色。選択中は赤系。
+                let bg = |present: bool| -> Option<u32> {
+                    match (row.status, present) {
+                        (IniStatus::Same, _) => None,
+                        (_, false) => Some(if selected { FILLER_SEL } else { FILLER }),
+                        (IniStatus::Changed, true) if section => None,
+                        (_, true) => Some(if selected { DIFF_SEL } else { DIFF }),
+                    }
+                };
+                let value_cell = |cell: &Option<diff_core::IniCell>| {
+                    let text = match (cell, section) {
+                        (Some(c), false) => c.text.clone(),
+                        _ => String::new(),
+                    };
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .border_r_1()
+                        .border_color(rgb(BORDER))
+                        .when_some(bg(cell.is_some()), |d, c| d.bg(rgb(c)))
+                        .child(text)
+                };
+                let key_text = if section {
+                    if row.section.is_empty() { "（セクションなし）".to_string() } else { format!("[{}]", row.section) }
+                } else {
+                    row.key.clone().unwrap_or_default()
+                };
+                let key_color = match row.status {
+                    IniStatus::Same => if section { DIR_NAME } else { TEXT },
+                    IniStatus::Changed => STATUS_DIFFERENT,
+                    IniStatus::LeftOnly => STATUS_LEFT_ONLY,
+                    IniStatus::RightOnly => STATUS_RIGHT_ONLY,
+                };
+                Some(
+                    div()
+                        .id(("ini-row", ix))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .w_full()
+                        .h(px(ROW_H + 2.))
+                        .font_family(MONO_FONT)
+                        .text_size(px(FONT_SIZE))
+                        .text_color(rgb(TEXT))
+                        .border_b_1()
+                        .border_color(rgb(GUTTER))
+                        .cursor_pointer()
+                        .when(section, |d| d.bg(rgb(GUTTER)))
+                        .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| t.select_ini_row(ri, cx)))
+                        .child(
+                            div()
+                                .w(px(INI_KEY_W))
+                                .flex_none()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .pl(px(if section { 6. } else { 22. }))
+                                .border_r_1()
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(key_color))
+                                .when(selected, |d| d.bg(rgb(ROW_SELECTED)))
+                                .child(key_text),
+                        )
+                        .child(value_cell(&row.left))
+                        .child(value_cell(&row.right))
+                        .into_any_element(),
+                )
+            })
+            .collect()
     }
 
     /// 左端の位置ペイン。左右のファイルを 1 本ずつのバーで表し、差分の位置と表示範囲を示す。
@@ -1850,6 +2190,14 @@ impl Render for CompareView {
 
         // 右下に出す「差分 n / m」。
         let counter = match &self.view {
+            View::File(f) if f.ini_mode => {
+                let diffs = f.ini_diff_rows();
+                match (f.ini_current.and_then(|c| diffs.iter().position(|&d| d == c)), diffs.len()) {
+                    (_, 0) => String::new(),
+                    (Some(p), n) => format!("差異 {} / {}", p + 1, n),
+                    (None, n) => format!("差異 {n} 件"),
+                }
+            }
             View::File(f) if !f.computing => match (f.current, f.diff.hunks.len()) {
                 (_, 0) => String::new(),
                 (Some(c), n) => format!("差分 {} / {}", c + 1, n),
@@ -1917,6 +2265,8 @@ impl Render for CompareView {
             .on_action(cx.listener(|t, _: &ExpandAll, _, cx| t.set_all_collapsed(false, cx)))
             .on_action(cx.listener(|t, _: &CollapseAll, _, cx| t.set_all_collapsed(true, cx)))
             .on_action(cx.listener(|t, _: &CancelCompare, _, cx| t.cancel_compare(cx)))
+            .on_action(cx.listener(|t, _: &ToggleIniMode, _, cx| t.toggle_ini_mode(cx)))
+            .on_action(cx.listener(|t, _: &ToggleIniOnlyDiffs, _, cx| t.toggle_ini_only_diffs(cx)))
             .on_action(cx.listener(|t, _: &FirstDiff, _, cx| t.goto_edge_hunk(false, cx)))
             .on_action(cx.listener(|t, _: &LastDiff, _, cx| t.goto_edge_hunk(true, cx)))
             .on_action(cx.listener(|t, _: &CopyToRight, _, cx| t.copy_current(Side::Right, cx)))

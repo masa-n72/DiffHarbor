@@ -21,6 +21,14 @@ impl Side {
     }
 }
 
+/// 行の置き換え。`start..end` の行を `new` に置き換える。`start == end` なら挿入。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineEdit {
+    pub start: usize,
+    pub end: usize,
+    pub new: Vec<String>,
+}
+
 /// 1 か所の置き換え。`at` から `old` を取り除き `new` を入れる。
 struct Edit {
     at: usize,
@@ -84,6 +92,34 @@ impl History {
         }
         self.next_rev += 1;
         let step = Step { side: to, edits, rev_before: self.rev(to), rev_after: self.next_rev };
+        self.rev[to.index()] = step.rev_after;
+        self.undo.push(step);
+        self.redo.clear();
+        true
+    }
+
+    /// 行の置き換えの組を `to` の側へ適用する。1 回の操作として記録する。
+    /// `edits` は現在の行に対する範囲で、重なっていないこと。変更がなければ false。
+    pub fn apply_edits(&mut self, left: &mut Vec<String>, right: &mut Vec<String>, mut edits: Vec<LineEdit>, to: Side) -> bool {
+        edits.retain(|e| e.start < e.end || !e.new.is_empty());
+        if edits.is_empty() {
+            return false;
+        }
+        let dst = match to {
+            Side::Left => left,
+            Side::Right => right,
+        };
+        // 後ろから適用すると、前の範囲の行番号がずれない。
+        edits.sort_by_key(|e| std::cmp::Reverse((e.start, e.end)));
+        let mut applied = Vec::with_capacity(edits.len());
+        for e in edits {
+            let end = e.end.min(dst.len());
+            let start = e.start.min(end);
+            let old: Vec<String> = dst.splice(start..end, e.new.iter().cloned()).collect();
+            applied.push(Edit { at: start, old, new: e.new });
+        }
+        self.next_rev += 1;
+        let step = Step { side: to, edits: applied, rev_before: self.rev(to), rev_after: self.next_rev };
         self.rev[to.index()] = step.rev_after;
         self.undo.push(step);
         self.redo.clear();
@@ -156,6 +192,25 @@ mod tests {
         assert!(h.copy_hunks(&mut l, &mut r, &d.hunks, Side::Left));
         assert_eq!(l, v("a b c Y Z"));
         assert_eq!(l, r);
+    }
+
+    #[test]
+    fn apply_edits_and_undo() {
+        let (mut l, mut r) = (v("a b c"), v("1 2 3 4"));
+        let mut h = History::new();
+        let edits = vec![
+            LineEdit { start: 0, end: 1, new: v("X Y") },
+            LineEdit { start: 2, end: 2, new: v("ins") },
+            LineEdit { start: 3, end: 4, new: vec![] },
+        ];
+        assert!(h.apply_edits(&mut l, &mut r, edits, Side::Right));
+        assert_eq!(r, v("X Y 2 ins 3"));
+        assert_eq!(l, v("a b c"));
+        assert_eq!(h.undo(&mut l, &mut r), Some(Side::Right));
+        assert_eq!(r, v("1 2 3 4"));
+        assert_eq!(h.redo(&mut l, &mut r), Some(Side::Right));
+        assert_eq!(r, v("X Y 2 ins 3"));
+        assert!(!h.apply_edits(&mut l, &mut r, vec![LineEdit { start: 1, end: 1, new: vec![] }], Side::Left));
     }
 
     #[test]
