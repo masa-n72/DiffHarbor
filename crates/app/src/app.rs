@@ -2,7 +2,7 @@
 
 use std::{
     cell::Cell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -19,12 +19,13 @@ use gpui::{
 };
 
 use diff_core::{
-    compare_dirs_with, copy_entry, diff_lines, diff_lines_deadline, recompare, side_path, token_spans, DiffResult,
-    Encoding, FolderEntry, History, Progress, RowKind, Side, Status, EUC_JP, SHIFT_JIS, UTF_8,
+    ancestors, compare_dirs_with, copy_entry, diff_lines, diff_lines_deadline, next_diff, recompare, side_path,
+    token_spans, tree_order, visible_rows, DiffResult, Encoding, FolderEntry, History, Progress, RowKind, ShowFilter,
+    Side, SortKey, Status, EUC_JP, SHIFT_JIS, UTF_8,
 };
 
 use crate::{
-    display::{display_width, expand_tabs},
+    display::{display_width, expand_tabs, format_size, format_time},
     document::Document,
     theme::*,
     location,
@@ -60,6 +61,14 @@ actions!(
         ReopenRightUtf8,
         ReopenRightShiftJis,
         ReopenRightEucJp,
+        SelectPrevItem,
+        SelectNextItem,
+        OpenItem,
+        CollapseItem,
+        ExpandItem,
+        ExpandAll,
+        CollapseAll,
+        CancelCompare,
     ]
 );
 
@@ -84,6 +93,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-r", Refresh, None),
         KeyBinding::new("secondary-[", Back, None),
         KeyBinding::new("secondary-w", CloseWindow, None),
+        // フォルダ一覧の操作。
+        KeyBinding::new("up", SelectPrevItem, Some("FolderView")),
+        KeyBinding::new("down", SelectNextItem, Some("FolderView")),
+        KeyBinding::new("enter", OpenItem, Some("FolderView")),
+        KeyBinding::new("left", CollapseItem, Some("FolderView")),
+        KeyBinding::new("right", ExpandItem, Some("FolderView")),
+        KeyBinding::new("escape", CancelCompare, None),
     ]);
     if !cfg!(target_os = "macos") {
         // Windows の慣習に合わせた追加のキー。
@@ -105,6 +121,10 @@ const FONT_SIZE: f32 = 12.0;
 const GUTTER_W: f32 = 48.0;
 /// 中央の操作列の幅。
 const MID_W: f32 = 44.0;
+/// フォルダ一覧の列の幅。
+const STATUS_COL_W: f32 = 110.0;
+const TIME_COL_W: f32 = 140.0;
+const SIZE_COL_W: f32 = 100.0;
 /// 左端の位置ペインの幅。
 const LOC_W: f32 = 44.0;
 /// 位置ペインの上下の余白。
@@ -147,20 +167,49 @@ fn debug_initial_h_scroll() -> f32 {
     }
 }
 
+/// フォルダ一覧の表示の設定。比べ直しても引き継ぐ。
+#[derive(Clone, Copy, Default)]
+struct FolderPrefs {
+    sort: SortKey,
+    descending: bool,
+    filter: ShowFilter,
+}
+
+/// 比べ直した後に戻す、選択と閉じたフォルダ（相対パスで覚える）。
+struct Restore {
+    selected: Option<PathBuf>,
+    collapsed: Vec<PathBuf>,
+}
+
 #[derive(Clone)]
 struct FolderView {
     left: PathBuf,
     right: PathBuf,
     entries: Vec<FolderEntry>,
+    /// 並べ替えた順（木の順）の項目番号。
+    order: Vec<usize>,
+    /// 一覧に出す行の項目番号。
     visible: Vec<usize>,
+    /// 選択中の行（visible での番号）。
     selected: Option<usize>,
-    only_diffs: bool,
+    /// 閉じているフォルダの項目番号。
+    collapsed: HashSet<usize>,
+    prefs: FolderPrefs,
 }
 
 impl FolderView {
-    fn new(left: PathBuf, right: PathBuf, entries: Vec<FolderEntry>, only_diffs: bool) -> Self {
-        let mut v = Self { left, right, entries, visible: Vec::new(), selected: None, only_diffs };
-        v.update_visible();
+    fn new(left: PathBuf, right: PathBuf, entries: Vec<FolderEntry>, prefs: FolderPrefs) -> Self {
+        let mut v = Self {
+            left,
+            right,
+            entries,
+            order: Vec::new(),
+            visible: Vec::new(),
+            selected: None,
+            collapsed: HashSet::new(),
+            prefs,
+        };
+        v.resort();
         v
     }
 
@@ -189,20 +238,64 @@ impl FolderView {
         s
     }
 
+    /// 並べ替えの設定に従って並べ直す。
+    fn resort(&mut self) {
+        self.order = tree_order(&self.entries, self.prefs.sort, self.prefs.descending);
+        self.update_visible();
+    }
+
+    /// 表示する行を決め直す。選択中の項目が隠れたら、見えている一番近い親フォルダを選ぶ。
     fn update_visible(&mut self) {
-        let keep = self.selected.and_then(|s| self.visible.get(s).copied());
-        self.visible = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| !self.only_diffs || e.status != Status::Identical)
-            .map(|(i, _)| i)
-            .collect();
-        self.selected = keep.and_then(|k| self.visible.iter().position(|&i| i == k));
+        let keep = self.selected_index();
+        self.visible = visible_rows(&self.entries, &self.order, &self.collapsed, self.prefs.filter);
+        self.selected = keep.and_then(|k| {
+            std::iter::once(k)
+                .chain(ancestors(&self.entries, k))
+                .find_map(|i| self.visible.iter().position(|&v| v == i))
+        });
     }
 
     fn selected_entry(&self) -> Option<&FolderEntry> {
         self.selected_index().map(|i| &self.entries[i])
+    }
+
+    /// 比べ直す前の状態を覚える。
+    fn remember(&self) -> Restore {
+        Restore {
+            selected: self.selected_entry().map(|e| e.rel.clone()),
+            collapsed: self.collapsed.iter().map(|&i| self.entries[i].rel.clone()).collect(),
+        }
+    }
+
+    /// 比べ直した後に、覚えておいた選択と閉じたフォルダを戻す。
+    fn restore(&mut self, r: Restore) {
+        let by_rel: HashMap<&Path, usize> = self.entries.iter().enumerate().map(|(i, e)| (e.rel.as_path(), i)).collect();
+        self.collapsed = r.collapsed.iter().filter_map(|p| by_rel.get(p.as_path()).copied()).collect();
+        let sel = r.selected.and_then(|p| by_rel.get(p.as_path()).copied());
+        self.update_visible();
+        self.selected = sel.and_then(|i| self.visible.iter().position(|&v| v == i));
+    }
+
+    /// フォルダ `ix`（entries の番号）を開く、または閉じる。
+    fn set_collapsed(&mut self, ix: usize, collapsed: bool) {
+        if !self.entries[ix].is_dir {
+            return;
+        }
+        if collapsed {
+            self.collapsed.insert(ix);
+        } else {
+            self.collapsed.remove(&ix);
+        }
+        self.update_visible();
+    }
+
+    /// 項目 `ix` が見えるように、親フォルダをすべて開いて選ぶ。
+    fn reveal(&mut self, ix: usize) {
+        for a in ancestors(&self.entries, ix) {
+            self.collapsed.remove(&a);
+        }
+        self.update_visible();
+        self.selected = self.visible.iter().position(|&v| v == ix);
     }
 }
 
@@ -361,6 +454,15 @@ fn app_menus() -> Vec<Menu> {
         ],
     });
     menus.push(Menu {
+        name: "表示".into(),
+        items: vec![
+            MenuItem::action("すべて開く", ExpandAll),
+            MenuItem::action("すべて閉じる", CollapseAll),
+            MenuItem::separator(),
+            MenuItem::action("比較を中止", CancelCompare),
+        ],
+    });
+    menus.push(Menu {
         name: "文字コード".into(),
         items: vec![
             MenuItem::action("左を自動判定で開き直す", ReopenLeftAuto),
@@ -401,7 +503,8 @@ pub struct DiffHarbor {
     status: SharedString,
     diff_scroll: UniformListScrollHandle,
     folder_scroll: UniformListScrollHandle,
-    only_diffs: bool,
+    /// フォルダ一覧の表示の設定。
+    folder_prefs: FolderPrefs,
     title: String,
     /// 等幅フォントの半角 1 文字の幅。最初の描画で測る。
     char_w: Option<f32>,
@@ -429,7 +532,7 @@ impl DiffHarbor {
             status: OPEN_HINT.into(),
             diff_scroll: UniformListScrollHandle::new(),
             folder_scroll: UniformListScrollHandle::new(),
-            only_diffs: false,
+            folder_prefs: FolderPrefs::default(),
             title: String::new(),
             char_w: None,
             loc_geom: Rc::new(Cell::new(None)),
@@ -620,12 +723,12 @@ impl DiffHarbor {
     }
 
     /// フォルダの比較を別スレッドで始める。実行中の比較があれば中止する。
-    /// 終わったら一覧を表示する。`keep` は選択を残す一覧の行、`done` は終わった時に出す文言。
+    /// 終わったら一覧を表示する。`restore` は比べ直す前の選択と開閉、`done` は終わった時に出す文言。
     fn start_folder_compare(
         &mut self,
         left: PathBuf,
         right: PathBuf,
-        keep: Option<usize>,
+        restore: Option<Restore>,
         done: Option<String>,
         cx: &mut Context<Self>,
     ) {
@@ -672,8 +775,10 @@ impl DiffHarbor {
                 this.folder_job = None;
                 match result {
                     Ok(entries) => {
-                        let mut f = FolderView::new(left, right, entries, this.only_diffs);
-                        f.selected = keep.filter(|&k| k < f.visible.len());
+                        let mut f = FolderView::new(left, right, entries, this.folder_prefs);
+                        if let Some(r) = restore {
+                            f.restore(r);
+                        }
                         let summary = f.summary();
                         this.status = match done {
                             Some(msg) => format!("{msg}（{summary}）"),
@@ -691,6 +796,17 @@ impl DiffHarbor {
         .detach();
     }
 
+    /// 実行中のフォルダ比較を中止する。開いているメニューがあれば、先にメニューを閉じる。
+    fn cancel_compare(&mut self, cx: &mut Context<Self>) {
+        if self.open_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if let Some(job) = &self.folder_job {
+            job.cancel();
+        }
+    }
+
     // ---- folder actions ----
 
     fn select_entry(&mut self, vis_ix: usize, cx: &mut Context<Self>) {
@@ -700,11 +816,126 @@ impl DiffHarbor {
         }
     }
 
+    /// 選択を上下に動かし、見える位置へスクロールする。
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let View::Folder(f) = &mut self.view else { return };
+        if f.visible.is_empty() {
+            return;
+        }
+        let next = match f.selected {
+            Some(s) => (s as isize + delta).clamp(0, f.visible.len() as isize - 1) as usize,
+            None => 0,
+        };
+        f.selected = Some(next);
+        let strategy = if delta > 0 { ScrollStrategy::Bottom } else { ScrollStrategy::Top };
+        self.folder_scroll.scroll_to_item(next, strategy);
+        cx.notify();
+    }
+
+    /// ← キー。開いたフォルダなら閉じ、そうでなければ親フォルダへ移る。
+    fn collapse_or_parent(&mut self, cx: &mut Context<Self>) {
+        let View::Folder(f) = &mut self.view else { return };
+        let Some(ix) = f.selected_index() else { return };
+        if f.entries[ix].is_dir && !f.collapsed.contains(&ix) {
+            f.set_collapsed(ix, true);
+        } else if let Some(p) = f.entries[ix].parent {
+            f.selected = f.visible.iter().position(|&v| v == p);
+            if let Some(s) = f.selected {
+                self.folder_scroll.scroll_to_item(s, ScrollStrategy::Top);
+            }
+        }
+        cx.notify();
+    }
+
+    /// → キー。閉じたフォルダなら開く。
+    fn expand_selected(&mut self, cx: &mut Context<Self>) {
+        let View::Folder(f) = &mut self.view else { return };
+        let Some(ix) = f.selected_index() else { return };
+        if f.collapsed.contains(&ix) {
+            f.set_collapsed(ix, false);
+            cx.notify();
+        }
+    }
+
+    fn toggle_collapse(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let View::Folder(f) = &mut self.view {
+            let now = f.collapsed.contains(&ix);
+            f.set_collapsed(ix, !now);
+            cx.notify();
+        }
+    }
+
+    fn set_all_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if let View::Folder(f) = &mut self.view {
+            f.collapsed = if collapsed {
+                f.entries.iter().enumerate().filter(|(_, e)| e.is_dir).map(|(i, _)| i).collect()
+            } else {
+                HashSet::new()
+            };
+            f.update_visible();
+            cx.notify();
+        }
+    }
+
+    /// 列見出しのクリック。同じ列なら昇順と降順を切り替える。
+    fn sort_by(&mut self, key: SortKey, cx: &mut Context<Self>) {
+        let p = &mut self.folder_prefs;
+        if p.sort == key {
+            p.descending = !p.descending;
+        } else {
+            p.sort = key;
+            p.descending = false;
+        }
+        let prefs = *p;
+        if let View::Folder(f) = &mut self.view {
+            f.prefs = prefs;
+            f.resort();
+        }
+        cx.notify();
+    }
+
+    /// 表示する状態の切り替え。
+    fn toggle_filter(&mut self, which: fn(&mut ShowFilter) -> &mut bool, cx: &mut Context<Self>) {
+        let flag = which(&mut self.folder_prefs.filter);
+        *flag = !*flag;
+        let prefs = self.folder_prefs;
+        if let View::Folder(f) = &mut self.view {
+            f.prefs = prefs;
+            f.update_visible();
+        }
+        cx.notify();
+    }
+
+    /// 次 / 前の差異のある項目へ移る。閉じたフォルダの中なら開く。
+    fn step_folder_diff(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let View::Folder(f) = &mut self.view else { return };
+        let Some(ix) = next_diff(&f.entries, &f.order, f.prefs.filter, f.selected_index(), forward) else {
+            self.set_status(if forward { "最後の差異です" } else { "最初の差異です" }, cx);
+            return;
+        };
+        f.reveal(ix);
+        if let Some(s) = f.selected {
+            self.folder_scroll.scroll_to_item(s, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    /// Enter キーとダブルクリック。フォルダは開閉し、ファイルは比較を開く。
+    fn activate_entry(&mut self, vis_ix: usize, cx: &mut Context<Self>) {
+        let View::Folder(f) = &self.view else { return };
+        let Some(&ei) = f.visible.get(vis_ix) else { return };
+        if f.entries[ei].is_dir && f.entries[ei].status != Status::Error {
+            self.toggle_collapse(ei, cx);
+        } else {
+            self.open_entry(vis_ix, cx);
+        }
+    }
+
     fn open_entry(&mut self, vis_ix: usize, cx: &mut Context<Self>) {
         let View::Folder(f) = &self.view else { return };
         let Some(&ei) = f.visible.get(vis_ix) else { return };
         let entry = f.entries[ei].clone();
-        if entry.is_dir {
+        if entry.is_dir && entry.status != Status::Error {
             return;
         }
         if entry.status == Status::Error {
@@ -764,18 +995,9 @@ impl DiffHarbor {
     /// 表示中のフォルダを比べ直す。比べ直す間も今の一覧を表示しておく。
     fn refresh_with(&mut self, done: Option<String>, cx: &mut Context<Self>) {
         if let View::Folder(f) = &self.view {
-            let (l, r, keep) = (f.left.clone(), f.right.clone(), f.selected);
-            self.start_folder_compare(l, r, keep, done, cx);
+            let (l, r, restore) = (f.left.clone(), f.right.clone(), f.remember());
+            self.start_folder_compare(l, r, Some(restore), done, cx);
         }
-    }
-
-    fn toggle_only_diffs(&mut self, cx: &mut Context<Self>) {
-        self.only_diffs = !self.only_diffs;
-        if let View::Folder(f) = &mut self.view {
-            f.only_diffs = self.only_diffs;
-            f.update_visible();
-        }
-        cx.notify();
     }
 
     // ---- file actions ----
@@ -1161,8 +1383,23 @@ impl DiffHarbor {
                     .child(Self::button("save", "保存", can_save).when(can_save, |b| b.on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.save(cx)))))
             })
             .when(in_folder, |d| {
+                let flt = self.folder_prefs.filter;
+                let toggle = |id: &'static str, label: &str, on: bool, which: fn(&mut ShowFilter) -> &mut bool| {
+                    Self::button(id, &format!("{}{label}", if on { "✓ " } else { "" }), true)
+                        .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| t.toggle_filter(which, cx)))
+                };
                 d.child(Self::button("refresh", "再比較", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.refresh(cx))))
-                    .child(Self::button("only-diffs", if self.only_diffs { "✓ 差分のみ" } else { "差分のみ" }, true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.toggle_only_diffs(cx))))
+                    .child(div().w(px(1.)).h(px(18.)).bg(rgb(BORDER)))
+                    .child(toggle("show-identical", "同一", flt.identical, |f| &mut f.identical))
+                    .child(toggle("show-different", "差異あり", flt.different, |f| &mut f.different))
+                    .child(toggle("show-left-only", "左のみ", flt.left_only, |f| &mut f.left_only))
+                    .child(toggle("show-right-only", "右のみ", flt.right_only, |f| &mut f.right_only))
+                    .child(div().w(px(1.)).h(px(18.)).bg(rgb(BORDER)))
+                    .child(Self::button("expand-all", "すべて開く", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.set_all_collapsed(false, cx))))
+                    .child(Self::button("collapse-all", "すべて閉じる", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.set_all_collapsed(true, cx))))
+            })
+            .when(self.folder_job.is_some(), |d| {
+                d.child(Self::button("cancel", "中止", true).on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.cancel_compare(cx))))
             })
             .into_any_element()
     }
@@ -1548,11 +1785,48 @@ impl DiffHarbor {
         let View::Folder(f) = &self.view else { return div().into_any_element() };
         let header = Self::path_header(f.left.display().to_string(), f.right.display().to_string());
         let count = f.visible.len();
+        let (sort, desc) = (f.prefs.sort, f.prefs.descending);
+        let head = |id: &'static str, label: &str, key: SortKey, w: Option<f32>, right: bool| {
+            let mark = if sort == key { if desc { " ▼" } else { " ▲" } } else { "" };
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .border_r_1()
+                .border_color(rgb(BORDER))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+                .map(|d| match w {
+                    Some(w) => d.w(px(w)).flex_none(),
+                    None => d.flex_1().min_w_0(),
+                })
+                .when(right, |d| d.flex().justify_end())
+                .child(format!("{label}{mark}"))
+                .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| t.sort_by(key, cx)))
+        };
+        let columns = div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(12.))
+            .text_color(rgb(TEXT))
+            .child(head("col-name", "名前", SortKey::Name, None, false))
+            .child(head("col-status", "比較結果", SortKey::Status, Some(STATUS_COL_W), false))
+            .child(head("col-ltime", "左の更新日時", SortKey::LeftTime, Some(TIME_COL_W), false))
+            .child(head("col-rtime", "右の更新日時", SortKey::RightTime, Some(TIME_COL_W), false))
+            .child(head("col-lsize", "左のサイズ", SortKey::LeftSize, Some(SIZE_COL_W), true))
+            .child(head("col-rsize", "右のサイズ", SortKey::RightSize, Some(SIZE_COL_W), true));
         div()
             .flex()
             .flex_col()
             .size_full()
             .child(header)
+            .child(columns)
             .child(
                 uniform_list(
                     "folder-rows",
@@ -1570,7 +1844,8 @@ impl DiffHarbor {
         let View::Folder(f) = &self.view else { return Vec::new() };
         range
             .filter_map(|ix| {
-                let entry = f.entries.get(*f.visible.get(ix)?)?;
+                let ei = *f.visible.get(ix)?;
+                let entry = f.entries.get(ei)?;
                 let selected = f.selected == Some(ix);
                 let (label, color) = match entry.status {
                     Status::Identical => ("同一", STATUS_IDENTICAL),
@@ -1580,7 +1855,42 @@ impl DiffHarbor {
                     Status::TypeMismatch => ("種類が異なる", STATUS_MISMATCH),
                     Status::Error => ("エラー", STATUS_ERROR),
                 };
-                let name = format!("{}{}", if entry.is_dir { "▾ " } else { "   " }, entry.name);
+                let collapsed = f.collapsed.contains(&ei);
+                let time = |m: Option<diff_core::Meta>| m.map(|m| format_time(m.modified)).unwrap_or_default();
+                let size = |m: Option<diff_core::Meta>| match m {
+                    Some(m) if !entry.is_dir => format_size(m.size),
+                    _ => String::new(),
+                };
+                let cell = |text: String, w: f32, right: bool| {
+                    div()
+                        .w(px(w))
+                        .flex_none()
+                        .px_2()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .when(right, |d| d.flex().justify_end())
+                        .child(text)
+                };
+                let twisty = if entry.is_dir && entry.status != Status::Error {
+                    div()
+                        .id(("twisty", ix))
+                        .w(px(16.))
+                        .flex_none()
+                        .text_color(rgb(DIM))
+                        .cursor_pointer()
+                        .child(if collapsed { "▸" } else { "▾" })
+                        // 行のクリック（選択）とは別に扱う。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |t, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                t.toggle_collapse(ei, cx);
+                            }),
+                        )
+                        .into_any_element()
+                } else {
+                    div().w(px(16.)).flex_none().into_any_element()
+                };
                 Some(
                     div()
                         .id(("entry", ix))
@@ -1597,20 +1907,33 @@ impl DiffHarbor {
                         .on_click(cx.listener(move |t, e: &ClickEvent, _, cx| {
                             t.select_entry(ix, cx);
                             if e.click_count() >= 2 {
-                                t.open_entry(ix, cx);
+                                t.activate_entry(ix, cx);
                             }
                         }))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .flex()
+                                .flex_row()
+                                .items_center()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .pl(px(10. + entry.depth as f32 * 18.))
-                                .when(entry.is_dir, |d| d.text_color(rgb(DIR_NAME)))
-                                .child(name),
+                                .pl(px(6. + entry.depth as f32 * 18.))
+                                .child(twisty)
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .when(entry.is_dir, |d| d.text_color(rgb(DIR_NAME)))
+                                        .child(entry.name.clone()),
+                                ),
                         )
-                        .child(div().w(px(120.)).flex_none().text_color(rgb(color)).child(label))
+                        .child(cell(label.to_string(), STATUS_COL_W, false).text_color(rgb(color)))
+                        .child(cell(time(entry.left), TIME_COL_W, false))
+                        .child(cell(time(entry.right), TIME_COL_W, false))
+                        .child(cell(size(entry.left), SIZE_COL_W, true))
+                        .child(cell(size(entry.right), SIZE_COL_W, true))
                         .into_any_element(),
                 )
             })
@@ -1657,7 +1980,7 @@ impl Render for DiffHarbor {
         };
 
         div()
-            .key_context("DiffHarbor")
+            .key_context(if matches!(self.view, View::Folder(_)) { "DiffHarbor FolderView" } else { "DiffHarbor" })
             .track_focus(&self.focus)
             .on_action(cx.listener(|t, _: &OpenLeft, window, cx| t.pick(Side::Left, window, cx)))
             .on_action(cx.listener(|t, _: &OpenRight, window, cx| t.pick(Side::Right, window, cx)))
@@ -1675,8 +1998,34 @@ impl Render for DiffHarbor {
             .on_action(cx.listener(|t, _: &ReopenRightUtf8, w, cx| t.guard(Pending::Reopen(Side::Right, Some(UTF_8)), w, cx)))
             .on_action(cx.listener(|t, _: &ReopenRightShiftJis, w, cx| t.guard(Pending::Reopen(Side::Right, Some(SHIFT_JIS)), w, cx)))
             .on_action(cx.listener(|t, _: &ReopenRightEucJp, w, cx| t.guard(Pending::Reopen(Side::Right, Some(EUC_JP)), w, cx)))
-            .on_action(cx.listener(|t, _: &NextDiff, _, cx| t.step_hunk(1, cx)))
-            .on_action(cx.listener(|t, _: &PrevDiff, _, cx| t.step_hunk(-1, cx)))
+            .on_action(cx.listener(|t, _: &NextDiff, _, cx| {
+                if matches!(t.view, View::Folder(_)) {
+                    t.step_folder_diff(true, cx)
+                } else {
+                    t.step_hunk(1, cx)
+                }
+            }))
+            .on_action(cx.listener(|t, _: &PrevDiff, _, cx| {
+                if matches!(t.view, View::Folder(_)) {
+                    t.step_folder_diff(false, cx)
+                } else {
+                    t.step_hunk(-1, cx)
+                }
+            }))
+            .on_action(cx.listener(|t, _: &SelectPrevItem, _, cx| t.move_selection(-1, cx)))
+            .on_action(cx.listener(|t, _: &SelectNextItem, _, cx| t.move_selection(1, cx)))
+            .on_action(cx.listener(|t, _: &OpenItem, _, cx| {
+                if let View::Folder(f) = &t.view {
+                    if let Some(s) = f.selected {
+                        t.activate_entry(s, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|t, _: &CollapseItem, _, cx| t.collapse_or_parent(cx)))
+            .on_action(cx.listener(|t, _: &ExpandItem, _, cx| t.expand_selected(cx)))
+            .on_action(cx.listener(|t, _: &ExpandAll, _, cx| t.set_all_collapsed(false, cx)))
+            .on_action(cx.listener(|t, _: &CollapseAll, _, cx| t.set_all_collapsed(true, cx)))
+            .on_action(cx.listener(|t, _: &CancelCompare, _, cx| t.cancel_compare(cx)))
             .on_action(cx.listener(|t, _: &FirstDiff, _, cx| t.goto_edge_hunk(false, cx)))
             .on_action(cx.listener(|t, _: &LastDiff, _, cx| t.goto_edge_hunk(true, cx)))
             .on_action(cx.listener(|t, _: &CopyToRight, _, cx| t.copy_current(Side::Right, cx)))

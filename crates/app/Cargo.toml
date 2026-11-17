@@ -7,6 +7,8 @@ edition.workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 diff-core.workspace = true
+# 更新日時をこの PC の時刻帯で表示するために使う。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Windows 用のマニフェスト（高 DPI 対応、確認ダイアログに使う Common Controls 6）を埋め込む。build.rs を参照。
 [build-dependencies]

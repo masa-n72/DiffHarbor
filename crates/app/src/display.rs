@@ -1,6 +1,8 @@
-//! 行を画面に出すための変換。タブの展開と表示幅の計算。
+//! 画面に出すための変換。タブの展開と表示幅の計算、サイズと日時の書式。
 
-use std::ops::Range;
+use std::{ops::Range, time::SystemTime};
+
+use chrono::{DateTime, Local, TimeZone};
 
 pub const TAB_WIDTH: usize = 4;
 
@@ -64,8 +66,53 @@ pub fn expand_tabs(line: &str, spans: &[Range<usize>]) -> (String, Vec<Range<usi
     (out, spans)
 }
 
+/// バイト数を 3 桁区切りで書く。
+pub fn format_size(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 更新日時を、この PC の時刻帯で `2026-11-17 10:23` の形に書く。日時がなければ空。
+pub fn format_time(t: Option<SystemTime>) -> String {
+    t.map(|t| format_time_in(t, &Local)).unwrap_or_default()
+}
+
+fn format_time_in<Tz: TimeZone>(t: SystemTime, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    DateTime::<chrono::Utc>::from(t).with_timezone(tz).format("%Y-%m-%d %H:%M").to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn formats_sizes_with_separators() {
+        assert_eq!(format_size(0), "0");
+        assert_eq!(format_size(999), "999");
+        assert_eq!(format_size(1000), "1,000");
+        assert_eq!(format_size(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn formats_times_in_a_time_zone() {
+        // 2026-11-17 01:23:45 UTC
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_878_625);
+        assert_eq!(format_time_in(t, &chrono::Utc), "2026-11-17 01:23");
+        let jst = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert_eq!(format_time_in(t, &jst), "2026-11-17 10:23");
+        assert_eq!(format_time(None), "");
+    }
+
     use super::*;
 
     #[test]

@@ -4,7 +4,8 @@
 //! そのため、左右で綴りが違うことがあり、各項目は左右それぞれの相対パスを持つ。
 
 use std::{
-    collections::BTreeMap,
+    cmp::Ordering as CmpOrdering,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -455,6 +456,212 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---- 一覧の表示（並べ替え、開閉、絞り込み） ----
+
+/// 一覧の並べ替えの基準。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortKey {
+    #[default]
+    Name,
+    Status,
+    LeftTime,
+    RightTime,
+    LeftSize,
+    RightSize,
+}
+
+/// 並べ替えで使う状態の順。差異の大きいものを先にする。
+fn status_rank(s: Status) -> u8 {
+    match s {
+        Status::Error => 0,
+        Status::Different => 1,
+        Status::TypeMismatch => 2,
+        Status::LeftOnly => 3,
+        Status::RightOnly => 4,
+        Status::Identical => 5,
+    }
+}
+
+/// None は昇順でも降順でも最後にする。
+fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> CmpOrdering {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            if descending {
+                y.cmp(&x)
+            } else {
+                x.cmp(&y)
+            }
+        }
+        (Some(_), None) => CmpOrdering::Less,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (None, None) => CmpOrdering::Equal,
+    }
+}
+
+/// 木の順（親の直後にその中身）に並べた項目番号の列。同じフォルダの中を `key` で並べる。
+/// フォルダは昇順でも降順でも常にファイルより先。同じ値の場合は名前順。
+pub fn tree_order(entries: &[FolderEntry], key: SortKey, descending: bool) -> Vec<usize> {
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    let mut roots = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        match e.parent {
+            Some(p) => children[p].push(i),
+            None => roots.push(i),
+        }
+    }
+    let by_name = |a: &FolderEntry, b: &FolderEntry| {
+        a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.name.cmp(&b.name))
+    };
+    let cmp = |&a: &usize, &b: &usize| {
+        let (ea, eb) = (&entries[a], &entries[b]);
+        let dirs_first = eb.is_dir.cmp(&ea.is_dir);
+        let by_key = match key {
+            SortKey::Name => {
+                let o = by_name(ea, eb);
+                if descending {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+            SortKey::Status => {
+                let o = status_rank(ea.status).cmp(&status_rank(eb.status));
+                if descending {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+            SortKey::LeftTime => cmp_opt(ea.left.and_then(|m| m.modified), eb.left.and_then(|m| m.modified), descending),
+            SortKey::RightTime => {
+                cmp_opt(ea.right.and_then(|m| m.modified), eb.right.and_then(|m| m.modified), descending)
+            }
+            SortKey::LeftSize => cmp_opt(ea.left.map(|m| m.size), eb.left.map(|m| m.size), descending),
+            SortKey::RightSize => cmp_opt(ea.right.map(|m| m.size), eb.right.map(|m| m.size), descending),
+        };
+        dirs_first.then(by_key).then_with(|| by_name(ea, eb))
+    };
+    roots.sort_by(cmp);
+    for c in children.iter_mut() {
+        c.sort_by(cmp);
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(i) = stack.pop() {
+        out.push(i);
+        stack.extend(children[i].iter().rev());
+    }
+    out
+}
+
+/// 一覧に出す状態の組み合わせ。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShowFilter {
+    pub identical: bool,
+    pub different: bool,
+    pub left_only: bool,
+    pub right_only: bool,
+}
+
+impl Default for ShowFilter {
+    fn default() -> Self {
+        Self { identical: true, different: true, left_only: true, right_only: true }
+    }
+}
+
+impl ShowFilter {
+    /// この状態の項目を出すか。「種類が異なる」は差異ありに含める。「エラー」は常に出す。
+    pub fn shows(&self, s: Status) -> bool {
+        match s {
+            Status::Identical => self.identical,
+            Status::Different | Status::TypeMismatch => self.different,
+            Status::LeftOnly => self.left_only,
+            Status::RightOnly => self.right_only,
+            Status::Error => true,
+        }
+    }
+}
+
+/// 各項目が絞り込みの条件に合うか。フォルダは、中に条件に合う項目があれば合う。
+/// 中身のないフォルダ（空、種類が異なる、エラー）は自分の状態で決める。
+fn passes(entries: &[FolderEntry], filter: ShowFilter) -> Vec<bool> {
+    let mut has_child = vec![false; entries.len()];
+    let mut ok = vec![false; entries.len()];
+    // 子は親より後ろにあるので、後ろから見れば子の結果が先に決まる。
+    for i in (0..entries.len()).rev() {
+        let e = &entries[i];
+        if !e.is_dir || !has_child[i] {
+            ok[i] = ok[i] || filter.shows(e.status);
+        }
+        if let Some(p) = e.parent {
+            has_child[p] = true;
+            if ok[i] {
+                ok[p] = true;
+            }
+        }
+    }
+    ok
+}
+
+/// 一覧に出す行（項目番号）。`order` の順で、閉じたフォルダの中身と、条件に合わない項目を除く。
+pub fn visible_rows(entries: &[FolderEntry], order: &[usize], collapsed: &HashSet<usize>, filter: ShowFilter) -> Vec<usize> {
+    let ok = passes(entries, filter);
+    let mut out = Vec::new();
+    // 閉じたフォルダの深さ。これより深い項目は飛ばす。
+    let mut skip_below: Option<usize> = None;
+    for &i in order {
+        let e = &entries[i];
+        if let Some(d) = skip_below {
+            if e.depth > d {
+                continue;
+            }
+            skip_below = None;
+        }
+        if !ok[i] {
+            continue;
+        }
+        out.push(i);
+        if e.is_dir && collapsed.contains(&i) {
+            skip_below = Some(e.depth);
+        }
+    }
+    out
+}
+
+/// `order` の中で、`from` の次（`forward` が false なら前）にある、差異のあるファイル。
+/// 条件に合わないものは飛ばす。閉じたフォルダの中も探す。`from` が None なら先頭（末尾）から探す。
+pub fn next_diff(
+    entries: &[FolderEntry],
+    order: &[usize],
+    filter: ShowFilter,
+    from: Option<usize>,
+    forward: bool,
+) -> Option<usize> {
+    let is_target = |i: usize| {
+        let e = &entries[i];
+        !e.is_dir && e.status != Status::Identical && filter.shows(e.status)
+    };
+    let pos = from.and_then(|f| order.iter().position(|&i| i == f));
+    if forward {
+        let start = pos.map_or(0, |p| p + 1);
+        order[start.min(order.len())..].iter().copied().find(|&i| is_target(i))
+    } else {
+        let end = pos.unwrap_or(order.len());
+        order[..end].iter().rev().copied().find(|&i| is_target(i))
+    }
+}
+
+/// 項目 `i` の祖先のフォルダ（近い順）。
+pub fn ancestors(entries: &[FolderEntry], i: usize) -> Vec<usize> {
+    let mut v = Vec::new();
+    let mut cur = entries[i].parent;
+    while let Some(p) = cur {
+        v.push(p);
+        cur = entries[p].parent;
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +675,110 @@ mod tests {
 
     fn find<'a>(e: &'a [FolderEntry], p: &str) -> &'a FolderEntry {
         e.iter().find(|x| x.rel == Path::new(p)).unwrap_or_else(|| panic!("{p} がない"))
+    }
+
+    /// 並べ替えと表示の確認用の一覧を作る。
+    fn sample(name: &str) -> (PathBuf, PathBuf, Vec<FolderEntry>) {
+        let root = tmp(name);
+        let (l, r) = (root.join("l"), root.join("r"));
+        for d in [&l, &r] {
+            fs::create_dir_all(d.join("b_dir/inner")).unwrap();
+            fs::create_dir_all(d.join("a_dir")).unwrap();
+        }
+        fs::write(l.join("z.txt"), "1").unwrap();
+        fs::write(r.join("z.txt"), "1").unwrap();
+        fs::write(l.join("m.txt"), "12345").unwrap();
+        fs::write(r.join("m.txt"), "1").unwrap();
+        fs::write(l.join("a_dir/same.txt"), "s").unwrap();
+        fs::write(r.join("a_dir/same.txt"), "s").unwrap();
+        fs::write(l.join("b_dir/inner/lonly.txt"), "x").unwrap();
+        fs::write(r.join("b_dir/ronly.txt"), "x").unwrap();
+        let e = compare_dirs(&l, &r).unwrap();
+        (l, r, e)
+    }
+
+    fn names(e: &[FolderEntry], rows: &[usize]) -> Vec<String> {
+        rows.iter().map(|&i| e[i].rel.to_string_lossy().replace('\\', "/")).collect()
+    }
+
+    #[test]
+    fn tree_order_sorts_within_folders_with_folders_first() {
+        let (_, _, e) = sample("view-tree_order_s");
+        let o = tree_order(&e, SortKey::Name, false);
+        assert_eq!(
+            names(&e, &o),
+            ["a_dir", "a_dir/same.txt", "b_dir", "b_dir/inner", "b_dir/inner/lonly.txt", "b_dir/ronly.txt", "m.txt", "z.txt"]
+        );
+        let o = tree_order(&e, SortKey::Name, true);
+        assert_eq!(
+            names(&e, &o),
+            ["b_dir", "b_dir/inner", "b_dir/inner/lonly.txt", "b_dir/ronly.txt", "a_dir", "a_dir/same.txt", "z.txt", "m.txt"]
+        );
+        // 状態順: 差異ありが同一より先。
+        let o = tree_order(&e, SortKey::Status, false);
+        let n = names(&e, &o);
+        assert!(n.iter().position(|x| x == "m.txt") < n.iter().position(|x| x == "z.txt"));
+        // サイズ順（左）: 降順なら 5 バイトの m.txt が先。
+        let o = tree_order(&e, SortKey::LeftSize, true);
+        let n = names(&e, &o);
+        assert!(n.iter().position(|x| x == "m.txt") < n.iter().position(|x| x == "z.txt"));
+        assert_eq!(o.len(), e.len());
+    }
+
+    #[test]
+    fn missing_values_sort_last() {
+        let (_, _, e) = sample("view-missing_valu");
+        for desc in [false, true] {
+            let o = tree_order(&e, SortKey::RightSize, desc);
+            let n = names(&e, &o);
+            let inner: Vec<_> = n.iter().filter(|x| x.starts_with("b_dir/") && !x.contains("inner/")).collect();
+            // b_dir の中: フォルダ inner が先、ronly.txt が次。
+            assert_eq!(inner, ["b_dir/inner", "b_dir/ronly.txt"]);
+        }
+    }
+
+    #[test]
+    fn visible_rows_collapse_and_filter() {
+        let (_, _, e) = sample("view-visible_rows");
+        let o = tree_order(&e, SortKey::Name, false);
+        let all = visible_rows(&e, &o, &HashSet::new(), ShowFilter::default());
+        assert_eq!(all, o);
+
+        // b_dir を閉じると中身が消える。
+        let b = e.iter().position(|x| x.name == "b_dir").unwrap();
+        let rows = visible_rows(&e, &o, &HashSet::from([b]), ShowFilter::default());
+        assert_eq!(names(&e, &rows), ["a_dir", "a_dir/same.txt", "b_dir", "m.txt", "z.txt"]);
+
+        // 同一を隠すと、同一のファイルと、中身がすべて同一のフォルダが消える。
+        let f = ShowFilter { identical: false, ..Default::default() };
+        let rows = visible_rows(&e, &o, &HashSet::new(), f);
+        assert_eq!(names(&e, &rows), ["b_dir", "b_dir/inner", "b_dir/inner/lonly.txt", "b_dir/ronly.txt", "m.txt"]);
+
+        // 左のみだけを出す。
+        let f = ShowFilter { identical: false, different: false, left_only: true, right_only: false };
+        let rows = visible_rows(&e, &o, &HashSet::new(), f);
+        assert_eq!(names(&e, &rows), ["b_dir", "b_dir/inner", "b_dir/inner/lonly.txt"]);
+    }
+
+    #[test]
+    fn next_diff_walks_files_with_differences() {
+        let (_, _, e) = sample("view-next_diff_wa");
+        let o = tree_order(&e, SortKey::Name, false);
+        let f = ShowFilter::default();
+        let first = next_diff(&e, &o, f, None, true).unwrap();
+        assert_eq!(e[first].name, "lonly.txt");
+        let second = next_diff(&e, &o, f, Some(first), true).unwrap();
+        assert_eq!(e[second].name, "ronly.txt");
+        let third = next_diff(&e, &o, f, Some(second), true).unwrap();
+        assert_eq!(e[third].name, "m.txt");
+        assert_eq!(next_diff(&e, &o, f, Some(third), true), None);
+        assert_eq!(next_diff(&e, &o, f, Some(third), false), Some(second));
+        assert_eq!(e[next_diff(&e, &o, f, None, false).unwrap()].name, "m.txt");
+        // 右のみを隠すと飛ばす。
+        let f = ShowFilter { right_only: false, ..Default::default() };
+        assert_eq!(next_diff(&e, &o, f, Some(first), true), Some(third));
+        let a = ancestors(&e, first);
+        assert_eq!(names(&e, &a), ["b_dir/inner", "b_dir"]);
     }
 
     #[test]
